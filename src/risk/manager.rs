@@ -1,16 +1,23 @@
 //! Portfolio risk management: pre-trade checks, position tracking, and
 //! real-time portfolio metrics.
+//!
+//! All thresholds are read from `RiskLimits` (configurable, data-driven).
+//! Correlation estimates are provided externally rather than from a hardcoded
+//! table, enabling data-driven pair-risk assessment.
 
 use std::collections::HashMap;
 
 use rust_decimal::prelude::ToPrimitive;
 
 use crate::{
-    config::Config,
     error::TradingError,
     signals::generator::{Direction, TradeSignal},
     stats::distribution::ReturnDist,
 };
+
+use super::limits::RiskLimits;
+
+// ── Position ──────────────────────────────────────────────────────────────────
 
 /// A single open position.
 #[derive(Debug, Clone)]
@@ -23,7 +30,7 @@ pub struct Position {
     pub stop_loss: f64,
     pub take_profit: f64,
     pub open_time_ms: u64,
-    pub oid: Option<u64>, // Exchange order ID after placement.
+    pub oid: Option<u64>,
     pub sl_oid: Option<u64>,
     pub tp_oid: Option<u64>,
 }
@@ -44,6 +51,8 @@ impl Position {
         now_ms.saturating_sub(self.open_time_ms) > max_duration_ms
     }
 }
+
+// ── Portfolio state ───────────────────────────────────────────────────────────
 
 /// Live portfolio state.
 #[derive(Debug, Clone)]
@@ -74,21 +83,18 @@ impl PortfolioState {
 
     pub fn net_exposure(&self) -> f64 {
         self.positions.values().map(|p| {
-            p.size_usd * p.leverage * if p.direction.is_long() { 1.0 } else { -1.0 }
+            let sign = if p.direction.is_long() { 1.0 } else { -1.0 };
+            p.size_usd * p.leverage * sign
         }).sum()
     }
 
     pub fn leverage_ratio(&self) -> f64 {
-        if self.nav < 1e-10 {
-            return 0.0;
-        }
+        if self.nav < 1e-10 { return 0.0; }
         self.gross_exposure() / self.nav
     }
 
     pub fn drawdown(&self) -> f64 {
-        if self.peak_nav < 1e-10 {
-            return 0.0;
-        }
+        if self.peak_nav < 1e-10 { return 0.0; }
         (self.peak_nav - self.nav) / self.peak_nav
     }
 
@@ -99,11 +105,27 @@ impl PortfolioState {
         }
     }
 
-    /// Pearson correlation between two positions' assets (simplified proxy).
-    pub fn position_correlation(&self, asset1: &str, asset2: &str) -> f64 {
-        // In production: read from DataStore rolling correlation.
-        // Here we use a hardcoded correlation table for the universe.
-        known_correlation(asset1, asset2)
+    /// Return correlation between two assets.
+    ///
+    /// `corr_matrix`: optional externally-supplied rolling correlation data
+    /// (keyed by sorted asset pair "A/B"). Falls back to a conservative 0.5.
+    pub fn position_correlation(
+        &self,
+        asset1: &str,
+        asset2: &str,
+        corr_matrix: Option<&HashMap<String, f64>>,
+    ) -> f64 {
+        if let Some(cm) = corr_matrix {
+            let key = if asset1 < asset2 {
+                format!("{}/{}", asset1, asset2)
+            } else {
+                format!("{}/{}", asset2, asset1)
+            };
+            if let Some(&c) = cm.get(&key) {
+                return c;
+            }
+        }
+        0.5 // Conservative default; no hardcoded asset-specific values.
     }
 
     pub fn has_position(&self, asset: &str) -> bool {
@@ -111,104 +133,118 @@ impl PortfolioState {
     }
 }
 
-/// Pre-trade risk checks.
+// ── Risk manager ──────────────────────────────────────────────────────────────
+
+/// Pre-trade risk checks driven entirely by `RiskLimits`.
 pub struct RiskManager<'a> {
-    pub config: &'a Config,
+    pub limits: &'a RiskLimits,
 }
 
 impl<'a> RiskManager<'a> {
-    pub fn new(config: &'a Config) -> Self {
-        Self { config }
+    pub fn new(limits: &'a RiskLimits) -> Self {
+        Self { limits }
     }
 
-    /// Validate a signal before execution. Returns an error if any check fails.
+    /// Validate a signal before execution.
     ///
-    /// `dist` is the fitted return distribution for the signal's asset.
-    /// When supplied it adds a tail-adequacy check: the stop-loss distance must
-    /// cover the absolute 99 % CVaR so the stop cannot be trivially blown
-    /// through by a tail event that the distribution deems plausible.
+    /// `dist`: fitted return distribution for tail-risk check (optional).
+    /// `corr_matrix`: rolling correlation data for pair-concentration check.
     pub fn check_signal(
         &self,
         signal: &TradeSignal,
         portfolio: &PortfolioState,
         dist: Option<&ReturnDist>,
+        corr_matrix: Option<&HashMap<String, f64>>,
     ) -> Result<(), TradingError> {
-        // 1. Drawdown limit.
-        if portfolio.drawdown() > self.config.daily_drawdown_limit {
+        // 1. Portfolio drawdown limit.
+        if portfolio.drawdown() > self.limits.max_daily_drawdown {
             return Err(TradingError::RiskCheckFailed {
                 reason: format!(
                     "Drawdown {:.1}% exceeds limit {:.1}%",
                     portfolio.drawdown() * 100.0,
-                    self.config.daily_drawdown_limit * 100.0
+                    self.limits.max_daily_drawdown * 100.0
                 ),
             });
         }
 
-        // 2. Maximum leverage.
-        let new_leverage =
-            (portfolio.gross_exposure() + signal.position_size_usd * signal.leverage) / portfolio.nav.max(1.0);
-        if new_leverage > self.config.max_portfolio_leverage {
+        // 2. Portfolio leverage limit.
+        let new_leverage = (portfolio.gross_exposure()
+            + signal.position_size_usd * signal.leverage)
+            / portfolio.nav.max(1.0);
+        if new_leverage > self.limits.max_gross_exposure {
             return Err(TradingError::RiskCheckFailed {
                 reason: format!(
-                    "Portfolio leverage {:.2}× would exceed max {:.2}×",
-                    new_leverage, self.config.max_portfolio_leverage
+                    "Portfolio leverage {:.2}x would exceed limit {:.2}x",
+                    new_leverage, self.limits.max_gross_exposure
                 ),
             });
         }
 
         // 3. Single-asset concentration.
-        let asset_notional =
-            signal.position_size_usd + portfolio.positions.get(&signal.asset).map(|p| p.size_usd).unwrap_or(0.0);
-        if asset_notional / portfolio.nav.max(1.0) > self.config.max_single_asset_weight {
+        let asset_notional = signal.position_size_usd
+            + portfolio.positions.get(&signal.asset).map(|p| p.size_usd).unwrap_or(0.0);
+        if asset_notional / portfolio.nav.max(1.0) > self.limits.max_single_asset_weight {
             return Err(TradingError::RiskCheckFailed {
                 reason: format!(
                     "{} would exceed {:.0}% weight limit",
                     signal.asset,
-                    self.config.max_single_asset_weight * 100.0
+                    self.limits.max_single_asset_weight * 100.0
                 ),
             });
         }
 
-        // 4. Correlation check: reject if adding would give >75% correlated pair.
-        for (pos_asset, _) in &portfolio.positions {
-            let corr = portfolio.position_correlation(&signal.asset, pos_asset);
-            if corr > 0.75 {
+        // 4. Correlation check (data-driven via rolling correlation matrix).
+        for pos_asset in portfolio.positions.keys() {
+            let corr = portfolio.position_correlation(&signal.asset, pos_asset, corr_matrix);
+            if corr > self.limits.max_pairwise_correlation {
                 return Err(TradingError::RiskCheckFailed {
                     reason: format!(
-                        "{} is >{:.0}% correlated with existing position {}",
+                        "{} correlation {:.0}% with {} exceeds limit {:.0}%",
                         signal.asset,
                         corr * 100.0,
-                        pos_asset
+                        pos_asset,
+                        self.limits.max_pairwise_correlation * 100.0
                     ),
                 });
             }
         }
 
-        // 5. Minimum risk–reward.
+        // 5. Minimum risk-reward.
         let rr = signal.risk_reward();
-        if rr < 1.5 {
+        if rr < self.limits.min_risk_reward {
             return Err(TradingError::RiskCheckFailed {
-                reason: format!("Risk-reward {:.2} below minimum 1.5", rr),
+                reason: format!("Risk-reward {:.2} below minimum {:.2}", rr, self.limits.min_risk_reward),
             });
         }
 
         // 6. Maximum concurrent positions.
-        if portfolio.n_open_positions() >= 5 {
+        if portfolio.n_open_positions() >= self.limits.max_concurrent_positions {
             return Err(TradingError::RiskCheckFailed {
-                reason: "Maximum 5 concurrent positions reached".into(),
+                reason: format!(
+                    "Maximum {} concurrent positions reached",
+                    self.limits.max_concurrent_positions
+                ),
             });
         }
 
-        // 7. Tail-adequacy: stop distance must cover the 99 % CVaR.
-        //    A stop tighter than the expected tail loss is unlikely to hold
-        //    during an adverse tail event implied by the fitted distribution.
+        // 7. Signal confidence.
+        if signal.signal_confidence < self.limits.min_signal_confidence {
+            return Err(TradingError::RiskCheckFailed {
+                reason: format!(
+                    "Signal confidence {:.2} below minimum {:.2}",
+                    signal.signal_confidence, self.limits.min_signal_confidence
+                ),
+            });
+        }
+
+        // 8. Tail-adequacy: stop distance must cover 99% CVaR.
         if let Some(dist) = dist {
-            let cvar_99 = dist.cvar(0.99).abs(); // magnitude of expected tail loss
+            let cvar_99 = dist.cvar(0.99).abs();
             let stop_dist = signal.stop_distance_pct();
             if cvar_99 > 0.0 && stop_dist < cvar_99 {
                 return Err(TradingError::RiskCheckFailed {
                     reason: format!(
-                        "Stop distance {:.2}% < 99% CVaR {:.2}% ({} dist); stop too tight for tail risk",
+                        "Stop distance {:.2}% < 99% CVaR {:.2}% ({} dist)",
                         stop_dist * 100.0,
                         cvar_99 * 100.0,
                         dist.name(),
@@ -221,13 +257,22 @@ impl<'a> RiskManager<'a> {
     }
 
     /// Determine if a position should be force-closed.
-    pub fn should_close(&self, pos: &Position, now_ms: u64, current_price: f64) -> Option<&'static str> {
-        // Time stop: 48h max holding period.
-        if pos.is_stale(now_ms, 48 * 3_600_000) {
+    ///
+    /// `max_hold_ms`: maximum holding period in milliseconds (from limits or
+    /// strategy config). Set to 48 × 3_600_000 for 48h.
+    pub fn should_close(
+        &self,
+        pos: &Position,
+        now_ms: u64,
+        current_price: f64,
+        max_hold_ms: u64,
+    ) -> Option<&'static str> {
+        // Time stop.
+        if pos.is_stale(now_ms, max_hold_ms) {
             return Some("time_stop");
         }
 
-        // Vol stop: if price moved against us by >2× the predicted vol, cut in half.
+        // Volatility stop: price moved >5% against us.
         let move_pct = (current_price - pos.entry_price).abs() / pos.entry_price.max(1e-10);
         if move_pct > 0.05 && pos.unrealised_pnl(current_price) < 0.0 {
             return Some("vol_stop");
@@ -235,27 +280,4 @@ impl<'a> RiskManager<'a> {
 
         None
     }
-}
-
-/// Approximate correlation table for the universe.
-fn known_correlation(a: &str, b: &str) -> f64 {
-    let pairs: &[(&str, &str, f64)] = &[
-        ("BTC", "ETH", 0.88),
-        ("BTC", "SOL", 0.78),
-        ("BTC", "HYPE", 0.55),
-        ("BTC", "ARB", 0.72),
-        ("BTC", "MATIC", 0.70),
-        ("BTC", "WIF", 0.60),
-        ("ETH", "SOL", 0.80),
-        ("ETH", "ARB", 0.82),
-        ("ETH", "MATIC", 0.83),
-        ("ETH", "HYPE", 0.58),
-        ("SOL", "WIF", 0.70),
-    ];
-    for &(x, y, c) in pairs {
-        if (x == a && y == b) || (x == b && y == a) {
-            return c;
-        }
-    }
-    0.5 // Default moderate correlation.
 }

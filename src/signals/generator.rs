@@ -1,5 +1,13 @@
-//! Signal generation: combines HMM regime state with ML ensemble output to
-//! produce structured trade signals with entry, stop-loss, and take-profit.
+//! Signal generation: converts ensemble distributions into structured trade
+//! signals with entry price, stop-loss, take-profit, and position sizing.
+//!
+//! ## Regime representation
+//! There is no explicit HMM regime classifier.  The `EnsembleDistribution`
+//! IS the regime: high σ → high-vol behaviour, high |μ|/σ → trending,
+//! high κ → consolidating.  The optimizer and risk manager adapt naturally.
+//!
+//! ## Pipeline
+//! EnsembleDistribution → signal filter → Kelly sizing → TradeSignal
 
 use std::collections::HashMap;
 
@@ -8,15 +16,15 @@ use uuid::Uuid;
 use crate::{
     assets::Asset,
     config::Config,
+    ensemble::EnsembleDistribution,
     features::assembler::FeatureRow,
-    hmm::model::{Regime, RegimeState},
-    ml::ensemble::EnsembleOutput,
+    optimizer::{PortfolioConstraints, PortfolioOptimizer, TradeDecision, kelly::KellyOptimizer},
     risk::manager::PortfolioState,
     stats::distribution::ReturnDist,
 };
 
 /// Trade direction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Direction {
     Long,
     Short,
@@ -45,19 +53,22 @@ pub struct TradeSignal {
     pub asset: String,
     pub asset_index: usize,
     pub direction: Direction,
-    /// Kalman-filtered entry price (limit order target).
+    /// Entry price (Kalman-filtered mid).
     pub entry_price: f64,
     pub stop_loss: f64,
     pub take_profit: f64,
     pub leverage: f64,
     pub position_size_usd: f64,
-    /// Expected value (edge × confidence).
     pub expected_value: f64,
     pub signal_confidence: f64,
     pub directional_edge: f64,
-    pub hmm_regime: Regime,
-    pub hmm_probability: f64,
     pub predicted_vol_4h: f64,
+    /// Distribution-derived regime label (replaces HMM regime).
+    pub regime_label: String,
+    /// Ensemble probability estimates.
+    pub ensemble_p_up: f64,
+    pub ensemble_p_down: f64,
+    pub ensemble_confidence: f64,
 }
 
 impl TradeSignal {
@@ -93,165 +104,126 @@ impl TradeSignal {
             "signal_confidence": self.signal_confidence,
             "directional_edge": self.directional_edge,
             "risk_reward": self.risk_reward(),
-            "hmm_regime": self.hmm_regime.label(),
-            "hmm_probability": self.hmm_probability,
+            "regime": self.regime_label,
+            "ensemble_p_up": self.ensemble_p_up,
+            "ensemble_p_down": self.ensemble_p_down,
+            "ensemble_confidence": self.ensemble_confidence,
             "predicted_vol_4h": self.predicted_vol_4h,
         })
     }
 }
 
-/// Generate trade signals from regime + ML outputs.
+/// Generate trade signals from ensemble distributions.
 ///
-/// `dist_models` optionally provides a per-asset fitted return distribution
-/// (selected by `ReturnDist::fit_best`). When present, position sizing uses
-/// the 95% CVaR as a tail-risk floor on effective volatility, so extremely
-/// heavy-tailed assets receive smaller positions even if GARCH vol is low.
+/// Replaces the old HMM + ML pipeline.  The optimizer determines direction
+/// and size; stop/take-profit levels are set from the predictive distribution.
+///
+/// `dist_models` provides per-asset return distributions for tail-risk checks.
 pub fn generate_signals(
     assets: &[Asset],
-    outputs: &HashMap<String, EnsembleOutput>,
+    distributions: &HashMap<String, EnsembleDistribution>,
     feature_rows: &HashMap<String, FeatureRow>,
-    regime: &RegimeState,
     portfolio: &PortfolioState,
     config: &Config,
     dist_models: &HashMap<String, ReturnDist>,
 ) -> Vec<TradeSignal> {
-    // Abort in low-confidence regimes.
-    if !regime.is_confident() {
-        return vec![];
-    }
-
-    // No new signals in high-vol regime.
-    if regime.regime == Regime::HighVol && portfolio.n_open_positions() > 0 {
-        return vec![];
-    }
-
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
-    let mut candidates: Vec<(f64, TradeSignal)> = Vec::new();
+    let constraints = PortfolioConstraints::from_risk_config(
+        config.max_portfolio_leverage,
+        config.max_single_asset_weight,
+        config.kelly_fraction,
+    );
 
-    for asset in assets {
-        let output = match outputs.get(&asset.symbol) {
-            Some(o) => o,
+    let optimizer = KellyOptimizer::new();
+    let decisions = optimizer.optimize(distributions, portfolio, &constraints);
+
+    let mut signals: Vec<TradeSignal> = Vec::new();
+
+    for decision in &decisions {
+        let asset = match assets.iter().find(|a| a.symbol == decision.asset) {
+            Some(a) => a,
             None => continue,
         };
-        let row = match feature_rows.get(&asset.symbol) {
+
+        let dist = match distributions.get(&decision.asset) {
+            Some(d) => d,
+            None => continue,
+        };
+
+        let row = match feature_rows.get(&decision.asset) {
             Some(r) => r,
             None => continue,
         };
 
-        // Minimum signal thresholds.
-        if output.signal_confidence < 0.60 {
-            continue;
-        }
-        if output.directional_edge.abs() < 0.25 {
-            continue;
-        }
-
-        let direction = if output.directional_edge > 0.0 {
-            Direction::Long
-        } else {
-            Direction::Short
-        };
-
-        // In consolidation, only allow mean-reversion (use OU z-score).
-        if regime.regime == Regime::Consolidation {
-            // Long only when spread is deeply negative (oversold vs. cointegration partner).
-            if direction.is_long() && row.ou_z_score > -1.5 {
-                continue;
-            }
-            if !direction.is_long() && row.ou_z_score < 1.5 {
-                continue;
-            }
-        }
-
-        let entry = row.kalman_level; // Kalman-filtered price as entry target.
+        let entry = row.kalman_level;
         if entry <= 0.0 {
             continue;
         }
 
-        // Vol-based stop distance.
-        let atr_stop = 2.0 * output.predicted_vol_4h * entry;
-        let (stop_loss, take_profit) = match direction {
-            Direction::Long => (
-                entry - atr_stop,
-                entry + atr_stop * regime.regime.min_rr(),
-            ),
-            Direction::Short => (
-                entry + atr_stop,
-                entry - atr_stop * regime.regime.min_rr(),
-            ),
+        // Stop distance: max(predictive_std, CVaR_95) × 2.0
+        let cvar_95 = dist_models
+            .get(&decision.asset)
+            .map(|d| d.cvar(0.95).abs())
+            .unwrap_or(0.0);
+        let predicted_vol = dist.predictive_std.max(cvar_95).max(0.001);
+        let atr_stop = 2.0 * predicted_vol * entry;
+
+        // Minimum risk-reward depends on regime.
+        let min_rr = regime_min_rr(dist);
+
+        let (stop_loss, take_profit) = match decision.direction {
+            Direction::Long => (entry - atr_stop, entry + atr_stop * min_rr),
+            Direction::Short => (entry + atr_stop, entry - atr_stop * min_rr),
         };
 
         if stop_loss <= 0.0 || take_profit <= 0.0 {
             continue;
         }
 
-        // Fractional Kelly leverage.
-        let p_win = if direction.is_long() { output.p_up } else { output.p_down };
-        let p_loss = 1.0 - p_win;
-        let avg_win = (take_profit - entry).abs() / entry;
-        let avg_loss = (stop_loss - entry).abs() / entry;
-        let kelly = if avg_win < 1e-10 || avg_loss < 1e-10 {
-            0.0
-        } else {
-            (p_win * avg_win - p_loss * avg_loss) / avg_win
-        };
-        let leverage = (kelly * config.kelly_fraction)
-            .clamp(1.0, regime.regime.max_leverage().min(asset.max_leverage as f64));
+        let ev = dist.directional_edge().abs() * dist.confidence;
 
-        // Position size from volatility targeting, with CVaR tail-risk floor.
-        //
-        // effective_vol = max(GARCH predicted_vol, |CVaR_95|)
-        // This ensures assets with heavy tails (Cauchy / discrete) are sized
-        // conservatively even when their conditional variance looks benign.
-        let cvar_95 = dist_models
-            .get(&asset.symbol)
-            .map(|d| d.cvar(0.95).abs())
-            .unwrap_or(0.0);
-        let effective_vol = output.predicted_vol_4h.max(cvar_95).max(0.001);
-
-        let nav = portfolio.nav;
-        let target_vol = config.target_daily_vol;
-        let position_size_usd = (nav * leverage * regime.regime.size_scale()
-            * target_vol
-            / effective_vol)
-        .min(nav * config.max_single_asset_weight);
-
-        let ev = output.directional_edge.abs() * output.signal_confidence;
-        let score = output.score();
-
-        let signal = TradeSignal {
+        signals.push(TradeSignal {
             signal_id: Uuid::new_v4().to_string(),
             generated_at_ms: now_ms,
             asset: asset.symbol.clone(),
             asset_index: asset.index,
-            direction,
+            direction: decision.direction,
             entry_price: entry,
             stop_loss,
             take_profit,
-            leverage,
-            position_size_usd,
+            leverage: decision.leverage,
+            position_size_usd: decision.position_size_usd,
             expected_value: ev,
-            signal_confidence: output.signal_confidence,
-            directional_edge: output.directional_edge,
-            hmm_regime: regime.regime,
-            hmm_probability: regime.probability,
-            predicted_vol_4h: output.predicted_vol_4h,
-        };
-
-        candidates.push((score, signal));
+            signal_confidence: decision.confidence,
+            directional_edge: dist.directional_edge(),
+            predicted_vol_4h: predicted_vol,
+            regime_label: decision.regime_label.clone(),
+            ensemble_p_up: dist.p_up,
+            ensemble_p_down: dist.p_down,
+            ensemble_confidence: dist.confidence,
+        });
     }
 
-    // Rank by score, take top 3, deduplicate assets.
-    candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-    let mut seen_assets = std::collections::HashSet::new();
-    candidates
+    // Rank by expected value; deduplicate assets; cap at 3 signals.
+    signals.sort_by(|a, b| b.expected_value.partial_cmp(&a.expected_value).unwrap());
+    let mut seen = std::collections::HashSet::new();
+    signals
         .into_iter()
-        .filter(|(_, s)| seen_assets.insert(s.asset.clone()))
+        .filter(|s| seen.insert(s.asset.clone()))
         .take(3)
-        .map(|(_, s)| s)
         .collect()
+}
+
+/// Minimum risk-reward ratio derived from the distribution (replaces HMM lookup).
+fn regime_min_rr(dist: &EnsembleDistribution) -> f64 {
+    match dist.regime_description() {
+        "high_vol" => 3.0,
+        "trending" => 2.0,
+        "consolidating" => 1.5,
+        _ => 2.0,
+    }
 }

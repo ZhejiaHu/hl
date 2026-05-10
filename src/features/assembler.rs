@@ -1,5 +1,5 @@
 //! Feature assembly: collects all raw signals into a unified flat feature row
-//! that the ML ensemble and HMM consume.
+//! consumed by the ML ensemble and ensemble fusion layer.
 
 use std::collections::HashMap;
 
@@ -7,6 +7,7 @@ use crate::{
     assets::Asset,
     data::store::DataStore,
     features::{
+        frequency::FrequencyFeatures,
         funding::{FundingFeatures, volatility_ratio},
         kalman::KalmanFilter,
     },
@@ -19,16 +20,16 @@ pub struct FeatureRow {
     pub asset: String,
     pub timestamp_ms: u64,
 
-    // ── GARCH ──────────────────────────────────────────────────
+    // GARCH
     pub garch_vol: f64,
 
-    // ── Kalman ─────────────────────────────────────────────────
+    // Kalman
     pub kalman_level: f64,
     pub kalman_velocity: f64,
     /// (price - kalman_level) / kalman_level
     pub kalman_level_dev: f64,
 
-    // ── Microstructure ─────────────────────────────────────────
+    // Microstructure
     pub spread_bps: f64,
     pub depth_ofi: f64,
     pub depth_ratio: f64,
@@ -37,23 +38,28 @@ pub struct FeatureRow {
     pub trade_imbalance: f64,
     pub hawkes_cross_ratio: f64,
 
-    // ── Funding ────────────────────────────────────────────────
+    // Funding
     pub funding_z: f64,
     pub funding_momentum: f64,
     pub vol_ratio: f64,
     pub premium_pct: f64,
 
-    // ── Cross-asset ────────────────────────────────────────────
+    // Cross-asset
     pub beta_to_btc: f64,
     pub idiosyncratic_ret: f64,
     pub ou_z_score: f64,
     pub corr_to_btc: f64,
+
+    // Frequency-domain — None until rolling window is full.
+    pub freq_features: Option<FrequencyFeatures>,
 }
 
 impl FeatureRow {
-    /// Flat f64 vector for ML input. Order must match model training.
+    /// Flat f64 vector for ML/ensemble input.
+    /// Frequency features (9 values) are appended after the 18 base features;
+    /// zeros are used when frequency features are not yet available.
     pub fn to_feature_vec(&self) -> Vec<f64> {
-        vec![
+        let mut v = vec![
             self.garch_vol,
             self.kalman_level_dev,
             self.kalman_velocity,
@@ -72,11 +78,17 @@ impl FeatureRow {
             self.idiosyncratic_ret,
             self.ou_z_score,
             self.corr_to_btc,
-        ]
+        ];
+        // Append frequency features (zeros if not available yet).
+        match &self.freq_features {
+            Some(f) => v.extend(f.to_vec()),
+            None => v.extend(vec![0.0; FrequencyFeatures::n_features()]),
+        }
+        v
     }
 
     pub fn n_features() -> usize {
-        18
+        18 + FrequencyFeatures::n_features()
     }
 }
 
@@ -89,10 +101,7 @@ pub struct FeatureStore {
 
 impl FeatureStore {
     pub fn new(max_rows: usize) -> Self {
-        Self {
-            rows: HashMap::new(),
-            max_rows,
-        }
+        Self { rows: HashMap::new(), max_rows }
     }
 
     pub fn push(&mut self, row: FeatureRow) {
@@ -118,10 +127,11 @@ impl FeatureStore {
 
 /// Assemble one feature row from the data store for a given asset.
 ///
-/// - `garch_vol`: pre-computed GARCH conditional vol (from stats module).
-/// - `ou_z`: pre-computed OU spread z-score (from cointegration module).
+/// - `garch_vol`: GARCH conditional vol (from stats module).
+/// - `ou_z`: OU spread z-score (from cointegration module).
 /// - `btc_returns`: BTC 5m log-return series for cross-asset features.
-/// - `hawkes_cross_ratio`: buy→sell cross-excitation ratio (from Hawkes module).
+/// - `hawkes_cross_ratio`: buy→sell cross-excitation ratio (Hawkes module).
+/// - `freq_features`: optional frequency features (from FrequencyExtractor).
 pub fn assemble_row(
     asset: &Asset,
     store: &DataStore,
@@ -130,6 +140,7 @@ pub fn assemble_row(
     ou_z: f64,
     btc_returns: &[f64],
     hawkes_cross_ratio: f64,
+    freq_features: Option<FrequencyFeatures>,
 ) -> Option<FeatureRow> {
     let sym = &asset.symbol;
     let now_ms = std::time::SystemTime::now()
@@ -137,7 +148,6 @@ pub fn assemble_row(
         .ok()?
         .as_millis() as u64;
 
-    // 5m bars — primary timeframe.
     let bars_5m = store.bars_for(sym, "5m")?;
     if bars_5m.len() < 30 {
         return None;
@@ -146,7 +156,6 @@ pub fn assemble_row(
     let closes: Vec<f64> = bars_5m.iter().map(|b| b.close).collect();
     let returns_5m: Vec<f64> = bars_5m.iter().map(|b| b.log_return).collect();
 
-    // 1h and 1d returns for volatility ratio.
     let returns_1h: Vec<f64> = store
         .bars_for(sym, "1h")
         .map(|b| b.iter().map(|bar| bar.log_return).collect())
@@ -156,12 +165,10 @@ pub fn assemble_row(
         .map(|b| b.iter().map(|bar| bar.log_return).collect())
         .unwrap_or_default();
 
-    // Kalman level and velocity.
     let price = *closes.last()?;
     let (kl, kv) = kalman.update(price);
     let kalman_level_dev = if kl.abs() > 1e-10 { (price - kl) / kl } else { 0.0 };
 
-    // Order book features.
     let book = store.books.get(sym).cloned().unwrap_or_default();
     let adv_24h_usd = volume_24h_usd(store, sym);
     let ob = OrderBookFeatures::compute(&book, adv_24h_usd);
@@ -172,7 +179,6 @@ pub fn assemble_row(
         .map(|t| t.imbalance())
         .unwrap_or(0.5);
 
-    // Funding features.
     let ctx = store.asset_ctx.get(sym).cloned().unwrap_or_default();
     let ff = store.funding.get(sym).map_or_else(FundingFeatures::default, |hist| {
         FundingFeatures::compute(hist, ctx.mark_px, ctx.oracle_px)
@@ -180,7 +186,6 @@ pub fn assemble_row(
 
     let vol_ratio = volatility_ratio(&returns_1h, &returns_1d);
 
-    // Cross-asset features vs BTC.
     let beta_to_btc = rolling_beta(&returns_5m, btc_returns, 60).unwrap_or(1.0);
     let btc_last_ret = btc_returns.last().copied().unwrap_or(0.0);
     let asset_last_ret = returns_5m.last().copied().unwrap_or(0.0);
@@ -209,10 +214,11 @@ pub fn assemble_row(
         idiosyncratic_ret,
         ou_z_score: ou_z,
         corr_to_btc,
+        freq_features,
     })
 }
 
-// ─── private helpers ────────────────────────────────────────────────────────
+// ── Private helpers ───────────────────────────────────────────────────────────
 
 fn volume_24h_usd(store: &DataStore, asset: &str) -> f64 {
     store

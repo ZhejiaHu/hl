@@ -3,26 +3,43 @@ use std::env;
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    // Exchange credentials
     pub private_key: String,
     pub wallet_address: String,
     pub use_testnet: bool,
 
-    // Risk
+    // Risk (delegated to RiskLimits at runtime, but stored here for backward compat)
     pub max_portfolio_leverage: f64,
     pub max_single_asset_weight: f64,
     pub daily_drawdown_limit: f64,
     pub target_daily_vol: f64,
     pub kelly_fraction: f64,
 
-    // Model
-    pub hmm_states: usize,
-    pub gb_n_estimators: usize,
-    pub gb_learning_rate: f64,
-    pub gb_max_depth: usize,
+    // Historical bootstrap
     pub history_days: u64,
 
     // Execution
     pub signal_interval_secs: u64,
+    pub max_signal_age_ms: u64,
+
+    // Dual Kalman Filter
+    pub dkf_sigma_obs: f64,
+    pub dkf_sigma_param_walk: f64,
+
+    // Frequency extractor
+    pub freq_window_bars: usize,
+
+    // Ensemble fusion
+    pub fusion_evidence_decay: f64,
+    pub fusion_min_weight: f64,
+
+    // Backtest
+    pub backtest_train_bars: usize,
+    pub backtest_test_bars: usize,
+
+    // Market impact model
+    pub impact_eta: f64,
+    pub impact_kappa: f64,
 }
 
 impl Config {
@@ -34,39 +51,48 @@ impl Config {
                 .unwrap_or_default()
                 .parse()
                 .unwrap_or(false),
-            max_portfolio_leverage: env::var("MAX_PORTFOLIO_LEVERAGE")
-                .unwrap_or_else(|_| "3.0".into())
-                .parse()?,
-            max_single_asset_weight: env::var("MAX_SINGLE_ASSET_WEIGHT")
-                .unwrap_or_else(|_| "0.30".into())
-                .parse()?,
-            daily_drawdown_limit: env::var("DAILY_DRAWDOWN_LIMIT")
-                .unwrap_or_else(|_| "0.08".into())
-                .parse()?,
-            target_daily_vol: env::var("TARGET_DAILY_VOL")
-                .unwrap_or_else(|_| "0.015".into())
-                .parse()?,
-            kelly_fraction: env::var("KELLY_FRACTION")
-                .unwrap_or_else(|_| "0.3".into())
-                .parse()?,
-            hmm_states: env::var("HMM_STATES")
-                .unwrap_or_else(|_| "4".into())
-                .parse()?,
-            gb_n_estimators: env::var("GB_N_ESTIMATORS")
-                .unwrap_or_else(|_| "100".into())
-                .parse()?,
-            gb_learning_rate: env::var("GB_LEARNING_RATE")
-                .unwrap_or_else(|_| "0.1".into())
-                .parse()?,
-            gb_max_depth: env::var("GB_MAX_DEPTH")
-                .unwrap_or_else(|_| "3".into())
-                .parse()?,
-            history_days: env::var("HISTORY_DAYS")
-                .unwrap_or_else(|_| "180".into())
-                .parse()?,
-            signal_interval_secs: env::var("SIGNAL_INTERVAL_SECS")
-                .unwrap_or_else(|_| "300".into())
-                .parse()?,
+
+            max_portfolio_leverage: parse_env_f64("MAX_PORTFOLIO_LEVERAGE", 3.0)?,
+            max_single_asset_weight: parse_env_f64("MAX_SINGLE_ASSET_WEIGHT", 0.30)?,
+            daily_drawdown_limit: parse_env_f64("DAILY_DRAWDOWN_LIMIT", 0.08)?,
+            target_daily_vol: parse_env_f64("TARGET_DAILY_VOL", 0.015)?,
+            kelly_fraction: parse_env_f64("KELLY_FRACTION", 0.3)?,
+
+            history_days: parse_env_u64("HISTORY_DAYS", 180)?,
+            signal_interval_secs: parse_env_u64("SIGNAL_INTERVAL_SECS", 300)?,
+            max_signal_age_ms: parse_env_u64("MAX_SIGNAL_AGE_MS", 5_000)?,
+
+            dkf_sigma_obs: parse_env_f64("DKF_SIGMA_OBS", 1e-3)?,
+            dkf_sigma_param_walk: parse_env_f64("DKF_SIGMA_PARAM_WALK", 1e-5)?,
+
+            freq_window_bars: parse_env_usize("FREQ_WINDOW_BARS", 64)?,
+
+            fusion_evidence_decay: parse_env_f64("FUSION_EVIDENCE_DECAY", 0.99)?,
+            fusion_min_weight: parse_env_f64("FUSION_MIN_WEIGHT", 0.05)?,
+
+            backtest_train_bars: parse_env_usize("BACKTEST_TRAIN_BARS", 500)?,
+            backtest_test_bars: parse_env_usize("BACKTEST_TEST_BARS", 100)?,
+
+            impact_eta: parse_env_f64("IMPACT_ETA", 0.1)?,
+            impact_kappa: parse_env_f64("IMPACT_KAPPA", 0.3)?,
         })
     }
+}
+
+fn parse_env_f64(key: &str, default: f64) -> Result<f64> {
+    Ok(env::var(key)
+        .unwrap_or_else(|_| default.to_string())
+        .parse()?)
+}
+
+fn parse_env_u64(key: &str, default: u64) -> Result<u64> {
+    Ok(env::var(key)
+        .unwrap_or_else(|_| default.to_string())
+        .parse()?)
+}
+
+fn parse_env_usize(key: &str, default: usize) -> Result<usize> {
+    Ok(env::var(key)
+        .unwrap_or_else(|_| default.to_string())
+        .parse()?)
 }
