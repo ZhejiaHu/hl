@@ -47,16 +47,13 @@ use features::{
     frequency::FrequencyExtractor,
     kalman::KalmanFilter,
 };
-use optimizer::{
-    PortfolioConstraints,
-    kelly::KellyOptimizer,
-};
+use optimizer::{AssetDistribution, OrderLeg};
 use orderbook::hawkes::HawkesProcess;
 use risk::{
     limits::{KillSwitchEvaluator, RiskLimits, EwmaVolEstimator, KillAction},
     manager::{PortfolioState, RiskManager},
 };
-use signals::generator::generate_signals;
+use signals::generator::{Direction, TradeSignal, generate_combo};
 use stats::{
     cointegration::{OuProcess, find_cointegrated_pairs, fit_ou},
     distribution::ReturnDist,
@@ -83,7 +80,7 @@ async fn main() -> Result<()> {
     let mut portfolio = PortfolioState::new(10_000.0);
     let executor = Executor::new(&config)?;
 
-    // ── Risk configuration ────────────────────────────────────────────────────
+    // ── Risk + execution configuration ───────────────────────────────────────
     let risk_limits = RiskLimits::from_env();
     let exec_model = ExecutionModel::new(
         config.max_signal_age_ms,
@@ -121,7 +118,7 @@ async fn main() -> Result<()> {
         })
         .collect();
 
-    // Legacy estimators (kept for ML ensemble and cointegration).
+    // Legacy estimators (kept for feature assembly and cointegration).
     let mut kalman_filters: HashMap<String, KalmanFilter> = assets
         .iter()
         .map(|a| (a.symbol.clone(), KalmanFilter::default_crypto()))
@@ -137,7 +134,6 @@ async fn main() -> Result<()> {
         .map(|a| (a.symbol.clone(), EwmaVolEstimator::new(0.94)))
         .collect();
 
-    // Initial GARCH / distribution fit.
     retrain_distributions(&store, &assets, &mut garch_models, &mut dist_models, &mut ou_processes);
 
     if let Err(e) = executor.refresh_portfolio(&mut portfolio, &wallet).await {
@@ -168,7 +164,7 @@ async fn main() -> Result<()> {
 
         info!("── Tick {} ─────────────────────────────────────", tick_count);
 
-        // Weekly refit of GARCH / distributions (every 2016 ticks at 5m = 7 days).
+        // Weekly refit of GARCH / distributions.
         if tick_count % 2016 == 0 {
             info!("Weekly model refit…");
             retrain_distributions(&store, &assets, &mut garch_models, &mut dist_models, &mut ou_processes);
@@ -201,7 +197,6 @@ async fn main() -> Result<()> {
                 }
                 KillAction::ReduceAll { fraction, reason } => {
                     warn!("KILL SWITCH ReduceAll({}): {}", fraction, reason);
-                    // Position reduction is handled in next signal cycle via reduced sizing.
                 }
                 KillAction::HaltNewTrades { reason } => {
                     warn!("KILL SWITCH HaltNewTrades: {}", reason);
@@ -212,15 +207,14 @@ async fn main() -> Result<()> {
             }
         }
 
-        // ── Per-asset: update all estimators ─────────────────────────────────
+        // ── Per-asset: update estimators, build AssetDistributions ───────────
         let btc_returns: Vec<f64> = store.read().returns("BTC", "5m");
-        let mut ensemble_distributions: HashMap<String, EnsembleDistribution> = HashMap::new();
+        let mut asset_dists: Vec<AssetDistribution> = Vec::new();
         let mut latest_rows: HashMap<String, features::assembler::FeatureRow> = HashMap::new();
 
         for asset in &assets {
             let sym = &asset.symbol;
 
-            // Price for this tick.
             let price = {
                 let s = store.read();
                 s.bars_for(sym, "5m")
@@ -228,39 +222,32 @@ async fn main() -> Result<()> {
                     .map(|b| b.close)
                     .unwrap_or(0.0)
             };
-            if price <= 0.0 {
-                continue;
-            }
+            if price <= 0.0 { continue; }
 
-            // Update EWMA vol.
+            // EWMA vol update.
             let log_ret = {
                 let s = store.read();
-                let rets = s.returns(sym, "5m");
-                rets.last().copied().unwrap_or(0.0)
+                s.returns(sym, "5m").last().copied().unwrap_or(0.0)
             };
             if let Some(ev) = ewma_vols.get_mut(sym) {
                 ev.update(log_ret);
             }
 
-            // ── Dual Kalman Filter update ─────────────────────────────────────
+            // ── Dual Kalman Filter ────────────────────────────────────────────
             let volume = store.read()
                 .bars_for(sym, "5m")
                 .and_then(|b| b.back())
                 .map(|b| b.volume)
                 .unwrap_or(0.0);
-            let timestamp_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-
-            let obs = Observation { price, volume, timestamp_ms };
+            let now_ms = timestamp_now_ms();
+            let obs = Observation { price, volume, timestamp_ms: now_ms };
             let dkf = dual_kalman_filters.get_mut(sym).unwrap();
             let posterior = match dkf.update(&obs) {
                 Ok(p) => p,
                 Err(e) => { warn!("DKF update failed for {}: {}", sym, e); continue; }
             };
 
-            // ── Frequency extractor update ────────────────────────────────────
+            // ── Frequency extractor ───────────────────────────────────────────
             let freq_ext = freq_extractors.get_mut(sym).unwrap();
             let freq_feat = freq_ext.update(price);
 
@@ -274,10 +261,38 @@ async fn main() -> Result<()> {
 
             let fusion = bayesian_fusions.get_mut(sym).unwrap();
             if let Some(dist) = fusion.fuse(&[Some(ks), fs, obs_signal]) {
-                ensemble_distributions.insert(sym.clone(), dist);
+                // TC estimate from live order book spread + fixed impact buffer.
+                let spread_bps = store.read()
+                    .books
+                    .get(sym)
+                    .and_then(|b| b.spread_bps())
+                    .unwrap_or(10.0);
+                let estimated_tc_bps = spread_bps + 2.0;
+
+                // CVaR from fitted return distribution.
+                let cvar_95 = dist_models.get(sym).map(|d| d.cvar(0.95).abs()).unwrap_or(0.0);
+                let cvar_99 = dist_models.get(sym).map(|d| d.cvar(0.99).abs()).unwrap_or(0.0);
+
+                // Signed current position fraction.
+                let current_fraction = portfolio.positions.get(sym)
+                    .map(|p| {
+                        let sign = if p.direction.is_long() { 1.0 } else { -1.0 };
+                        sign * p.size_usd / portfolio.nav.max(1.0)
+                    })
+                    .unwrap_or(0.0);
+
+                asset_dists.push(AssetDistribution {
+                    asset: sym.clone(),
+                    ensemble: dist,
+                    current_fraction,
+                    entry_price: posterior.level,
+                    estimated_tc_bps,
+                    cvar_95,
+                    cvar_99,
+                });
             }
 
-            // ── Legacy feature row (for ML ensemble / GARCH) ──────────────────
+            // ── Legacy feature row (for feature store) ────────────────────────
             let garch_vol = garch_models
                 .get(sym)
                 .map(|g| {
@@ -304,56 +319,69 @@ async fn main() -> Result<()> {
                 let s = store.read();
                 assemble_row(asset, &s, kf, garch_vol, ou_z, &btc_returns, hawkes_ratio, freq_feat)
             };
-
             if let Some(row) = row {
                 latest_rows.insert(sym.clone(), row.clone());
                 feature_store.push(row);
             }
         }
 
-        // ── Signal generation via distribution-based optimizer ────────────────
-        let signals = generate_signals(
-            &assets,
-            &ensemble_distributions,
-            &latest_rows,
-            &portfolio,
-            &config,
-            &dist_models,
+        // ── Joint combo optimization ──────────────────────────────────────────
+        let combo = match generate_combo(&asset_dists, &portfolio, &config) {
+            Some(c) => c,
+            None => {
+                info!("No combo order generated this tick");
+                monitor_positions(&executor, &mut portfolio, &store, &risk_limits).await;
+                log_portfolio_state(&portfolio);
+                continue;
+            }
+        };
+
+        info!(
+            "Combo order: {} leg(s), ELG={:.5}, TC={:.2}bps, regime={}",
+            combo.n_legs(),
+            combo.total_expected_log_growth,
+            combo.total_tc_bps,
+            combo.regime_summary()
         );
 
-        // ── Risk checks and execution ─────────────────────────────────────────
-        for signal in &signals {
-            info!("Signal: {}", serde_json::to_string_pretty(&signal.to_json()).unwrap_or_default());
+        // ── Risk checks and execution per leg ─────────────────────────────────
+        for leg in &combo.legs {
+            let asset_idx = assets.iter().find(|a| a.symbol == leg.asset).map(|a| a.index).unwrap_or(0);
+            let signal = leg_to_signal(leg, asset_idx);
 
-            let dist = dist_models.get(&signal.asset).map(|d| d as &ReturnDist);
-            match risk_mgr.check_signal(signal, &portfolio, dist, None) {
+            let dist = dist_models.get(&leg.asset).map(|d| d as &ReturnDist);
+            match risk_mgr.check_signal(&signal, &portfolio, dist, None) {
                 Ok(()) => {
-                    // Evaluate execution quality.
                     let adv_24h = store.read()
-                        .bars_for(&signal.asset, "1h")
+                        .bars_for(&leg.asset, "1h")
                         .map(|b| b.iter().rev().take(24).map(|bar| bar.volume * bar.close).sum::<f64>())
                         .unwrap_or(1e8);
                     let spread_pct = store.read()
                         .books
-                        .get(&signal.asset)
+                        .get(&leg.asset)
                         .and_then(|b| b.spread_bps())
                         .map(|s| s / 10_000.0)
                         .unwrap_or(0.0001);
                     let depth_usd = store.read()
                         .books
-                        .get(&signal.asset)
+                        .get(&leg.asset)
                         .map(|b| b.bid_depth(10) + b.ask_depth(10))
                         .unwrap_or(1e6);
 
-                    let exec_metrics = exec_model.evaluate(signal, timestamp_now_ms(), adv_24h, spread_pct, depth_usd);
+                    let exec_metrics = exec_model.evaluate(&signal, timestamp_now_ms(), adv_24h, spread_pct, depth_usd);
                     if exec_metrics.is_executable {
-                        info!("Executing {} {} (fill_p={:.2}%)", signal.direction, signal.asset, exec_metrics.fill_probability * 100.0);
-                        execute_signal(&executor, signal, &mut portfolio, &store).await;
+                        info!(
+                            "Executing leg: {} {} (fill_p={:.1}%, impact={:.2}bps)",
+                            leg.direction, leg.asset,
+                            exec_metrics.fill_probability * 100.0,
+                            exec_metrics.total_cost_pct * 10_000.0,
+                        );
+                        execute_signal(&executor, &signal, &mut portfolio, &store).await;
                     } else {
-                        warn!("Execution rejected for {}: {}", signal.asset, exec_metrics.rejection_reason);
+                        warn!("Leg execution rejected for {}: {}", leg.asset, exec_metrics.rejection_reason);
                     }
                 }
-                Err(e) => warn!("Risk check failed for {}: {}", signal.asset, e),
+                Err(e) => warn!("Risk check failed for {} leg: {}", leg.asset, e),
             }
         }
 
@@ -371,14 +399,47 @@ fn timestamp_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Convert an `OrderLeg` to a `TradeSignal` for risk checking and execution.
+///
+/// The `TradeSignal` interface is used by `RiskManager` and `Executor` which
+/// pre-date the combo architecture. Ensemble fields are approximated from the
+/// leg's direction and confidence since the full distribution is in the combo.
+fn leg_to_signal(leg: &OrderLeg, asset_index: usize) -> TradeSignal {
+    let now_ms = timestamp_now_ms();
+    let (p_up, p_down) = match leg.direction {
+        Direction::Long => (leg.confidence, 1.0 - leg.confidence),
+        Direction::Short => (1.0 - leg.confidence, leg.confidence),
+    };
+    TradeSignal {
+        signal_id: uuid::Uuid::new_v4().to_string(),
+        generated_at_ms: now_ms,
+        asset: leg.asset.clone(),
+        asset_index,
+        direction: leg.direction,
+        entry_price: leg.entry_price,
+        stop_loss: leg.stop_loss,
+        take_profit: leg.take_profit,
+        leverage: leg.leverage,
+        position_size_usd: leg.position_size_usd,
+        expected_value: leg.expected_log_growth,
+        signal_confidence: leg.confidence,
+        directional_edge: if leg.is_long() { leg.confidence } else { -leg.confidence },
+        predicted_vol_4h: 0.0,
+        regime_label: leg.regime_label.clone(),
+        ensemble_p_up: p_up,
+        ensemble_p_down: p_down,
+        ensemble_confidence: leg.confidence,
+    }
+}
+
 async fn execute_signal(
     executor: &Executor,
-    signal: &signals::generator::TradeSignal,
+    signal: &TradeSignal,
     portfolio: &mut PortfolioState,
     store: &Arc<RwLock<DataStore>>,
 ) {
     let oid = match executor.place_entry(signal).await {
-        Ok(id) => { info!("Entry order OID={} for {} {}", id, signal.direction, signal.asset); id }
+        Ok(id) => { info!("Entry OID={} for {} {}", id, signal.direction, signal.asset); id }
         Err(e) => { error!("Failed to place entry for {}: {}", signal.asset, e); return; }
     };
 

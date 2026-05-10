@@ -87,20 +87,45 @@ Regime representation is continuous: the estimated probability distribution over
                                │
                                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│  PORTFOLIO OPTIMIZER  (constrained Kelly)                           │
+│  ASSET DISTRIBUTION  (per-asset pre-optimization bundle)            │
 │                                                                     │
-│  Single-period Kelly:  f* = μ/(σ²+μ²) × kelly_fraction             │
-│  Transaction-cost adjusted; turnover penalty applied                │
+│  AssetDistribution {                                                │
+│    ensemble: EnsembleDistribution   ← fused regime distribution    │
+│    current_fraction: f64            ← signed position / NAV        │
+│    entry_price: f64                 ← Kalman level                 │
+│    estimated_tc_bps: f64            ← spread + impact proxy        │
+│    cvar_95, cvar_99: f64            ← from fitted ReturnDist       │
+│  }                                                                  │
+│  Built per-asset per-tick; the joint optimizer's sole input type.   │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  JOINT COMBO OPTIMIZER  (KellyOptimizer::optimize_combo)            │
 │                                                                     │
-│  DP extension: backward induction on 41-point position grid         │
-│  over configurable horizon; rewards = ELG - TC + continuation value │
+│  1. Per-asset Kelly fractions: f*_i = kelly_frac × μ_i/(σ_i²+μ_i²)│
+│     TC-adjusted; turnover penalty applied using asset-specific bps  │
 │                                                                     │
-│  Constraints enforced:                                              │
-│    max_position_fraction · max_gross/net_exposure · max_leverage    │
-│    If gross > max → scale all positions proportionally              │
+│  2. Subset selection (cardinality + TC budget constraints):         │
+│     objective = Σ_i [ELG_i − Δf_i·tc_i]  (net expected log growth)│
+│     constraint: card({i: |f_i|>0}) ≤ MAX_COMBO_ASSETS              │
+│     constraint: Σ_i [Δf_i·tc_bps_i] ≤ MAX_COMBO_TC_BPS            │
+│     • Exhaustive C(n,k) search when n_candidates ≤ 10              │
+│       (ENUMERATE_COMBO_SUBSETS=true; global optimum guaranteed)     │
+│     • Greedy rank-by-score for larger candidate sets                │
 │                                                                     │
-│  → TradeDecision { direction, position_fraction, leverage,          │
-│                    expected_log_growth, confidence, regime_label }  │
+│  3. Portfolio constraint scaling:                                   │
+│     Σ|f_i| ≤ max_gross_exposure                                     │
+│     |Σ f_i| ≤ max_net_exposure                                      │
+│     → uniform scale-down if either is exceeded                      │
+│                                                                     │
+│  4. Leg construction:                                               │
+│     entry/stop/TP from AssetDistribution; stop = 2×max(σ, CVaR_95) │
+│                                                                     │
+│  → ComboOrder { legs: Vec<OrderLeg>, total_elg, total_tc_bps,      │
+│                 gross_exposure_fraction, net_exposure_fraction }    │
+│                                                                     │
+│  Example output: "long 0.20 BTC + short 0.15 ETH" (2 legs)         │
 └──────────────────────────────┬──────────────────────────────────────┘
                                │
                                ▼
@@ -193,11 +218,11 @@ src/
 │   └── fusion.rs             — BayesianFusion: log-evidence EMA weights; signal adapters
 │
 ├── optimizer/
-│   ├── mod.rs                — PortfolioOptimizer trait; PortfolioConstraints; TradeDecision
-│   └── kelly.rs              — KellyOptimizer: single-period + DP backward induction
+│   ├── mod.rs                — AssetDistribution; ComboConfig; ComboOrder; OrderLeg; PortfolioOptimizer trait
+│   └── kelly.rs              — KellyOptimizer: joint combo + DP extension
 │
 ├── signals/
-│   └── generator.rs          — generate_signals(): ensemble-driven, Kelly-sized TradeSignal
+│   └── generator.rs          — generate_combo() → ComboOrder (primary); generate_signals() (backtest compat)
 │
 ├── risk/
 │   ├── manager.rs            — RiskManager (7 pre-trade checks) · PortfolioState · Position
@@ -275,6 +300,32 @@ Three built-in adapters convert module outputs into `SignalOutput`:
 - `kalman_signal(posterior)` — uses KF innovation and uncertainty
 - `frequency_signal(freq, velocity)` — uses dominant-period power and spectral entropy
 - `orderbook_signal(hawkes)` — uses cross-excitation ratio as directional pressure
+
+---
+
+## Joint combo optimization
+
+`AssetDistribution` is the boundary type between estimation and optimization. After each tick, the main loop builds one per asset:
+
+```
+DualKF posterior → entry_price, cvar from ReturnDist
+BayesianFusion   → ensemble: EnsembleDistribution
+order book spread → estimated_tc_bps
+portfolio state   → current_fraction (signed)
+```
+
+`KellyOptimizer::optimize_combo` then solves the joint problem in four steps:
+
+| Step | What happens |
+|---|---|
+| 1 — Per-asset sizing | f*_i = kelly_fraction × μ_i/(σ_i²+μ_i²), TC-adjusted per asset |
+| 2 — Subset selection | Maximise Σ(ELG_i − Δf_i·tc_i) subject to cardinality and TC budget |
+| 3 — Exposure scaling | Uniform scale-down if gross or net exposure exceeds portfolio limits |
+| 4 — Leg construction | Entry, stop (2×max(σ,CVaR₉₅)), take-profit (regime-dependent R:R) |
+
+**Subset selection** uses exhaustive C(n,k) enumeration when n_candidates ≤ 10 (at most C(10,3)=120 evaluations; global optimum guaranteed) and falls back to greedy ranking for larger sets.
+
+**TC budget constraint**: Σ_i [|f_i_new − f_i_prev| × estimated_tc_bps_i] ≤ MAX_COMBO_TC_BPS ensures the total round-trip cost of the combo stays within the configured budget. Assets are excluded (worst ELG/TC ratio first) until the budget is met.
 
 ---
 
@@ -357,6 +408,9 @@ All parameters are read from environment variables (`.env` supported via `dotenv
 | `BACKTEST_TEST_BARS` | `100` | Walk-forward test window size |
 | `IMPACT_ETA` | `0.1` | Almgren-Chriss permanent impact η |
 | `IMPACT_KAPPA` | `0.3` | Almgren-Chriss temporary impact κ |
+| `MAX_COMBO_ASSETS` | `3` | Cardinality: maximum legs in one combo order |
+| `MAX_COMBO_TC_BPS` | `25.0` | Total TC budget across all legs in bps |
+| `ENUMERATE_COMBO_SUBSETS` | `true` | Exhaustive subset search when n_candidates ≤ 10 |
 | `HISTORY_DAYS` | `180` | Days of OHLCV to bootstrap at startup |
 | `SIGNAL_INTERVAL_SECS` | `300` | Main loop interval (5 minutes) |
 

@@ -40,6 +40,11 @@ pub struct Config {
     // Market impact model
     pub impact_eta: f64,
     pub impact_kappa: f64,
+
+    // Joint combo optimizer
+    pub max_combo_assets: usize,       // Cardinality: max legs in one combo
+    pub max_combo_tc_bps: f64,         // Total TC budget across all legs in bps
+    pub enumerate_combo_subsets: bool, // Exhaustive subset search when n ≤ 10
 }
 
 impl Config {
@@ -75,6 +80,13 @@ impl Config {
 
             impact_eta: parse_env_f64("IMPACT_ETA", 0.1)?,
             impact_kappa: parse_env_f64("IMPACT_KAPPA", 0.3)?,
+
+            max_combo_assets: parse_env_usize("MAX_COMBO_ASSETS", 3)?,
+            max_combo_tc_bps: parse_env_f64("MAX_COMBO_TC_BPS", 25.0)?,
+            enumerate_combo_subsets: env::var("ENUMERATE_COMBO_SUBSETS")
+                .unwrap_or_default()
+                .parse()
+                .unwrap_or(true),
         })
     }
 }
