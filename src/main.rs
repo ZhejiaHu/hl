@@ -36,6 +36,7 @@ use risk::manager::{PortfolioState, RiskManager};
 use signals::generator::generate_signals;
 use stats::{
     cointegration::{OuProcess, find_cointegrated_pairs, fit_ou},
+    distribution::ReturnDist,
     garch::Garch11,
 };
 
@@ -76,6 +77,7 @@ async fn main() -> Result<()> {
         .collect();
 
     let mut garch_models: HashMap<String, Garch11> = HashMap::new();
+    let mut dist_models: HashMap<String, ReturnDist> = HashMap::new();
     let mut ou_processes: Vec<OuProcess> = Vec::new();
     let mut hawkes_models: HashMap<String, HawkesProcess> = HashMap::new();
     let mut feature_store = FeatureStore::new(500);
@@ -97,6 +99,7 @@ async fn main() -> Result<()> {
         &assets,
         &mut kalman_filters,
         &mut garch_models,
+        &mut dist_models,
         &mut ou_processes,
         &mut feature_store,
         &mut ml_ensemble,
@@ -139,6 +142,7 @@ async fn main() -> Result<()> {
                 &assets,
                 &mut kalman_filters,
                 &mut garch_models,
+                &mut dist_models,
                 &mut ou_processes,
                 &mut feature_store,
                 &mut ml_ensemble,
@@ -234,6 +238,7 @@ async fn main() -> Result<()> {
             &current_regime,
             &portfolio,
             &config,
+            &dist_models,
         );
 
         // ── Risk checks and execution ────────────────────────────────────────
@@ -242,7 +247,8 @@ async fn main() -> Result<()> {
         for signal in &signals {
             info!("Signal: {}", serde_json::to_string_pretty(&signal.to_json()).unwrap_or_default());
 
-            match risk_mgr.check_signal(signal, &portfolio) {
+            let dist = dist_models.get(&signal.asset).map(|d| d as &ReturnDist);
+            match risk_mgr.check_signal(signal, &portfolio, dist) {
                 Ok(()) => {
                     info!("Risk check passed for {} {}", signal.direction, signal.asset);
                     execute_signal(&executor, signal, &mut portfolio, &store).await;
@@ -388,6 +394,7 @@ fn retrain_all(
     assets: &[assets::Asset],
     kalman_filters: &mut HashMap<String, KalmanFilter>,
     garch_models: &mut HashMap<String, Garch11>,
+    dist_models: &mut HashMap<String, ReturnDist>,
     ou_processes: &mut Vec<OuProcess>,
     feature_store: &mut FeatureStore,
     ml_ensemble: &mut ModelEnsemble,
@@ -396,7 +403,7 @@ fn retrain_all(
 ) {
     let s = store.read();
 
-    // GARCH fitting.
+    // GARCH + return distribution fitting.
     for asset in assets {
         let returns = s.returns(&asset.symbol, "1h");
         if returns.len() >= 50 {
@@ -409,6 +416,23 @@ fn retrain_all(
                     garch_models.insert(asset.symbol.clone(), g);
                 }
                 Err(e) => warn!("GARCH fit failed for {}: {}", asset.symbol, e),
+            }
+        }
+
+        // Fit the best return distribution (Student-t / Cauchy / Discrete).
+        if returns.len() >= 30 {
+            match ReturnDist::fit_best(&returns) {
+                Ok(d) => {
+                    info!(
+                        "ReturnDist {} → {} (AIC={:.1} KS={:.4})",
+                        asset.symbol,
+                        d.name(),
+                        d.aic(),
+                        d.ks_stat(),
+                    );
+                    dist_models.insert(asset.symbol.clone(), d);
+                }
+                Err(e) => warn!("ReturnDist fit failed for {}: {}", asset.symbol, e),
             }
         }
     }

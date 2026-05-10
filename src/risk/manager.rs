@@ -9,6 +9,7 @@ use crate::{
     config::Config,
     error::TradingError,
     signals::generator::{Direction, TradeSignal},
+    stats::distribution::ReturnDist,
 };
 
 /// A single open position.
@@ -121,10 +122,16 @@ impl<'a> RiskManager<'a> {
     }
 
     /// Validate a signal before execution. Returns an error if any check fails.
+    ///
+    /// `dist` is the fitted return distribution for the signal's asset.
+    /// When supplied it adds a tail-adequacy check: the stop-loss distance must
+    /// cover the absolute 99 % CVaR so the stop cannot be trivially blown
+    /// through by a tail event that the distribution deems plausible.
     pub fn check_signal(
         &self,
         signal: &TradeSignal,
         portfolio: &PortfolioState,
+        dist: Option<&ReturnDist>,
     ) -> Result<(), TradingError> {
         // 1. Drawdown limit.
         if portfolio.drawdown() > self.config.daily_drawdown_limit {
@@ -190,6 +197,24 @@ impl<'a> RiskManager<'a> {
             return Err(TradingError::RiskCheckFailed {
                 reason: "Maximum 5 concurrent positions reached".into(),
             });
+        }
+
+        // 7. Tail-adequacy: stop distance must cover the 99 % CVaR.
+        //    A stop tighter than the expected tail loss is unlikely to hold
+        //    during an adverse tail event implied by the fitted distribution.
+        if let Some(dist) = dist {
+            let cvar_99 = dist.cvar(0.99).abs(); // magnitude of expected tail loss
+            let stop_dist = signal.stop_distance_pct();
+            if cvar_99 > 0.0 && stop_dist < cvar_99 {
+                return Err(TradingError::RiskCheckFailed {
+                    reason: format!(
+                        "Stop distance {:.2}% < 99% CVaR {:.2}% ({} dist); stop too tight for tail risk",
+                        stop_dist * 100.0,
+                        cvar_99 * 100.0,
+                        dist.name(),
+                    ),
+                });
+            }
         }
 
         Ok(())

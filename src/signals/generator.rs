@@ -12,6 +12,7 @@ use crate::{
     hmm::model::{Regime, RegimeState},
     ml::ensemble::EnsembleOutput,
     risk::manager::PortfolioState,
+    stats::distribution::ReturnDist,
 };
 
 /// Trade direction.
@@ -100,6 +101,11 @@ impl TradeSignal {
 }
 
 /// Generate trade signals from regime + ML outputs.
+///
+/// `dist_models` optionally provides a per-asset fitted return distribution
+/// (selected by `ReturnDist::fit_best`). When present, position sizing uses
+/// the 95% CVaR as a tail-risk floor on effective volatility, so extremely
+/// heavy-tailed assets receive smaller positions even if GARCH vol is low.
 pub fn generate_signals(
     assets: &[Asset],
     outputs: &HashMap<String, EnsembleOutput>,
@@ -107,6 +113,7 @@ pub fn generate_signals(
     regime: &RegimeState,
     portfolio: &PortfolioState,
     config: &Config,
+    dist_models: &HashMap<String, ReturnDist>,
 ) -> Vec<TradeSignal> {
     // Abort in low-confidence regimes.
     if !regime.is_confident() {
@@ -165,9 +172,8 @@ pub fn generate_signals(
             continue;
         }
 
-        // ATR-based stop distance.
-        let atr_stop = (2.0 * row.atr_norm * entry)
-            .max(1.5 * output.predicted_vol_4h * entry);
+        // Vol-based stop distance.
+        let atr_stop = 2.0 * output.predicted_vol_4h * entry;
         let (stop_loss, take_profit) = match direction {
             Direction::Long => (
                 entry - atr_stop,
@@ -196,12 +202,22 @@ pub fn generate_signals(
         let leverage = (kelly * config.kelly_fraction)
             .clamp(1.0, regime.regime.max_leverage().min(asset.max_leverage as f64));
 
-        // Position size from volatility targeting.
+        // Position size from volatility targeting, with CVaR tail-risk floor.
+        //
+        // effective_vol = max(GARCH predicted_vol, |CVaR_95|)
+        // This ensures assets with heavy tails (Cauchy / discrete) are sized
+        // conservatively even when their conditional variance looks benign.
+        let cvar_95 = dist_models
+            .get(&asset.symbol)
+            .map(|d| d.cvar(0.95).abs())
+            .unwrap_or(0.0);
+        let effective_vol = output.predicted_vol_4h.max(cvar_95).max(0.001);
+
         let nav = portfolio.nav;
         let target_vol = config.target_daily_vol;
         let position_size_usd = (nav * leverage * regime.regime.size_scale()
             * target_vol
-            / output.predicted_vol_4h.max(0.001))
+            / effective_vol)
         .min(nav * config.max_single_asset_weight);
 
         let ev = output.directional_edge.abs() * output.signal_confidence;

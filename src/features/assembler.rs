@@ -2,9 +2,6 @@
 //! that the ML ensemble and HMM consume.
 
 use std::collections::HashMap;
-use std::sync::Arc;
-
-use parking_lot::RwLock;
 
 use crate::{
     assets::Asset,
@@ -12,10 +9,8 @@ use crate::{
     features::{
         funding::{FundingFeatures, volatility_ratio},
         kalman::KalmanFilter,
-        technical::*,
     },
     orderbook::features::OrderBookFeatures,
-    stats::cointegration::OuProcess,
 };
 
 /// One complete feature row for one asset at one bar.
@@ -24,24 +19,14 @@ pub struct FeatureRow {
     pub asset: String,
     pub timestamp_ms: u64,
 
-    // ── Technical ──────────────────────────────────────────────
-    pub rsi_14: f64,
-    pub rsi_2: f64,
-    pub macd_hist: f64,
-    pub boll_pos: f64,
-    pub atr_norm: f64,
-    pub roc_1h: f64,
-    pub roc_4h: f64,
-    pub roc_24h: f64,
-    pub dist_high_20d: f64,
-    pub dist_low_20d: f64,
-    pub volume_z: f64,
+    // ── GARCH ──────────────────────────────────────────────────
     pub garch_vol: f64,
 
     // ── Kalman ─────────────────────────────────────────────────
     pub kalman_level: f64,
     pub kalman_velocity: f64,
-    pub kalman_level_dev: f64, // (price - kalman_level) / kalman_level
+    /// (price - kalman_level) / kalman_level
+    pub kalman_level_dev: f64,
 
     // ── Microstructure ─────────────────────────────────────────
     pub spread_bps: f64,
@@ -62,26 +47,13 @@ pub struct FeatureRow {
     pub beta_to_btc: f64,
     pub idiosyncratic_ret: f64,
     pub ou_z_score: f64,
-
-    // ── Macro ──────────────────────────────────────────────────
     pub corr_to_btc: f64,
 }
 
 impl FeatureRow {
-    /// Convert to flat f64 vector for ML input. Order must match model training.
+    /// Flat f64 vector for ML input. Order must match model training.
     pub fn to_feature_vec(&self) -> Vec<f64> {
         vec![
-            self.rsi_14,
-            self.rsi_2,
-            self.macd_hist,
-            self.boll_pos,
-            self.atr_norm,
-            self.roc_1h,
-            self.roc_4h,
-            self.roc_24h,
-            self.dist_high_20d,
-            self.dist_low_20d,
-            self.volume_z,
             self.garch_vol,
             self.kalman_level_dev,
             self.kalman_velocity,
@@ -104,7 +76,7 @@ impl FeatureRow {
     }
 
     pub fn n_features() -> usize {
-        29
+        18
     }
 }
 
@@ -146,9 +118,10 @@ impl FeatureStore {
 
 /// Assemble one feature row from the data store for a given asset.
 ///
-/// `garch_vol`: pre-computed GARCH conditional volatility (from stats module).
-/// `ou_z`: pre-computed OU spread z-score (from cointegration module).
-/// `btc_returns`: BTC return series for cross-asset features.
+/// - `garch_vol`: pre-computed GARCH conditional vol (from stats module).
+/// - `ou_z`: pre-computed OU spread z-score (from cointegration module).
+/// - `btc_returns`: BTC 5m log-return series for cross-asset features.
+/// - `hawkes_cross_ratio`: buy→sell cross-excitation ratio (from Hawkes module).
 pub fn assemble_row(
     asset: &Asset,
     store: &DataStore,
@@ -164,57 +137,29 @@ pub fn assemble_row(
         .ok()?
         .as_millis() as u64;
 
-    // 5m bars for most indicators (primary signal timeframe).
+    // 5m bars — primary timeframe.
     let bars_5m = store.bars_for(sym, "5m")?;
     if bars_5m.len() < 30 {
         return None;
     }
 
     let closes: Vec<f64> = bars_5m.iter().map(|b| b.close).collect();
-    let highs: Vec<f64> = bars_5m.iter().map(|b| b.high).collect();
-    let lows: Vec<f64> = bars_5m.iter().map(|b| b.low).collect();
-    let volumes: Vec<f64> = bars_5m.iter().map(|b| b.volume).collect();
     let returns_5m: Vec<f64> = bars_5m.iter().map(|b| b.log_return).collect();
 
-    // 1h bars for medium-term features.
+    // 1h and 1d returns for volatility ratio.
     let returns_1h: Vec<f64> = store
         .bars_for(sym, "1h")
         .map(|b| b.iter().map(|bar| bar.log_return).collect())
         .unwrap_or_default();
-
-    // 1d bars for long-term features.
     let returns_1d: Vec<f64> = store
         .bars_for(sym, "1d")
         .map(|b| b.iter().map(|bar| bar.log_return).collect())
         .unwrap_or_default();
-    let closes_1d: Vec<f64> = store
-        .bars_for(sym, "1d")
-        .map(|b| b.iter().map(|bar| bar.close).collect())
-        .unwrap_or_default();
 
+    // Kalman level and velocity.
     let price = *closes.last()?;
     let (kl, kv) = kalman.update(price);
     let kalman_level_dev = if kl.abs() > 1e-10 { (price - kl) / kl } else { 0.0 };
-
-    // RSI (on 5m closes mapped to ~1h equivalent = 12 bars).
-    let rsi_14 = rsi(&closes, 14).unwrap_or(50.0);
-    let rsi_2 = rsi(&closes, 2).unwrap_or(50.0);
-
-    let (_, _, macd_hist) = macd(&closes).unwrap_or((0.0, 0.0, 0.0));
-    let boll_pos = bollinger_position(&closes, 20, 2.0).unwrap_or(0.5);
-    let atr_val = atr(&highs, &lows, &closes, 14).unwrap_or(0.0);
-    let atr_norm = if price > 1e-10 { atr_val / price } else { 0.0 };
-
-    // ROC in 5m bars: 12×5m ≈ 1h, 48×5m ≈ 4h, 288×5m ≈ 1d.
-    let roc_1h = roc(&closes, 12).unwrap_or(0.0);
-    let roc_4h = roc(&closes, 48).unwrap_or(0.0);
-    let roc_24h = roc(&closes, 288).unwrap_or(0.0);
-
-    // 20-day distance from extremes: use 1d bars (20 bars = 20 days).
-    let dist_high_20d = dist_from_rolling_high(&closes_1d, 20).unwrap_or(0.0);
-    let dist_low_20d = dist_from_rolling_low(&closes_1d, 20).unwrap_or(0.0);
-
-    let volume_z = volume_z_score(&volumes, 60).unwrap_or(0.0);
 
     // Order book features.
     let book = store.books.get(sym).cloned().unwrap_or_default();
@@ -229,16 +174,13 @@ pub fn assemble_row(
 
     // Funding features.
     let ctx = store.asset_ctx.get(sym).cloned().unwrap_or_default();
-    let funding_hist = store.funding.get(sym);
-    let ff = if let Some(hist) = funding_hist {
+    let ff = store.funding.get(sym).map_or_else(FundingFeatures::default, |hist| {
         FundingFeatures::compute(hist, ctx.mark_px, ctx.oracle_px)
-    } else {
-        FundingFeatures::default()
-    };
+    });
 
     let vol_ratio = volatility_ratio(&returns_1h, &returns_1d);
 
-    // Cross-asset vs BTC.
+    // Cross-asset features vs BTC.
     let beta_to_btc = rolling_beta(&returns_5m, btc_returns, 60).unwrap_or(1.0);
     let btc_last_ret = btc_returns.last().copied().unwrap_or(0.0);
     let asset_last_ret = returns_5m.last().copied().unwrap_or(0.0);
@@ -248,17 +190,6 @@ pub fn assemble_row(
     Some(FeatureRow {
         asset: sym.clone(),
         timestamp_ms: now_ms,
-        rsi_14,
-        rsi_2,
-        macd_hist,
-        boll_pos,
-        atr_norm,
-        roc_1h,
-        roc_4h,
-        roc_24h,
-        dist_high_20d,
-        dist_low_20d,
-        volume_z,
         garch_vol,
         kalman_level: kl,
         kalman_velocity: kv,
@@ -281,16 +212,47 @@ pub fn assemble_row(
     })
 }
 
-/// Estimate 24h ADV in USD from 1h bars.
+// ─── private helpers ────────────────────────────────────────────────────────
+
 fn volume_24h_usd(store: &DataStore, asset: &str) -> f64 {
     store
         .bars_for(asset, "1h")
-        .map(|bars| {
-            bars.iter()
-                .rev()
-                .take(24)
-                .map(|b| b.volume * b.close)
-                .sum::<f64>()
-        })
+        .map(|bars| bars.iter().rev().take(24).map(|b| b.volume * b.close).sum::<f64>())
         .unwrap_or(1_000_000.0)
+}
+
+fn rolling_beta(asset_returns: &[f64], benchmark_returns: &[f64], period: usize) -> Option<f64> {
+    let n = asset_returns.len().min(benchmark_returns.len());
+    if n < period {
+        return None;
+    }
+    let ra = &asset_returns[n - period..];
+    let rb = &benchmark_returns[n - period..];
+    let mu_a = ra.iter().sum::<f64>() / period as f64;
+    let mu_b = rb.iter().sum::<f64>() / period as f64;
+    let cov: f64 = ra.iter().zip(rb).map(|(&a, &b)| (a - mu_a) * (b - mu_b)).sum();
+    let var_b: f64 = rb.iter().map(|&b| (b - mu_b).powi(2)).sum();
+    if var_b < 1e-15 {
+        return Some(0.0);
+    }
+    Some(cov / var_b)
+}
+
+fn rolling_correlation(r1: &[f64], r2: &[f64], period: usize) -> Option<f64> {
+    let n = r1.len().min(r2.len());
+    if n < period {
+        return None;
+    }
+    let t1 = &r1[n - period..];
+    let t2 = &r2[n - period..];
+    let mu1 = t1.iter().sum::<f64>() / period as f64;
+    let mu2 = t2.iter().sum::<f64>() / period as f64;
+    let cov: f64 = t1.iter().zip(t2).map(|(&x, &y)| (x - mu1) * (y - mu2)).sum();
+    let var1: f64 = t1.iter().map(|&x| (x - mu1).powi(2)).sum();
+    let var2: f64 = t2.iter().map(|&x| (x - mu2).powi(2)).sum();
+    let denom = (var1 * var2).sqrt();
+    if denom < 1e-15 {
+        return Some(0.0);
+    }
+    Some(cov / denom)
 }
