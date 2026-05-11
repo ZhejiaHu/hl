@@ -37,6 +37,9 @@ use crate::{
 /// Built once per tick per asset by the main loop (or backtest engine) after
 /// the estimation → ensemble pipeline has run. The joint optimizer reads a
 /// slice of these and produces a `ComboOrder`.
+///
+/// There is no dependency on batch-fitted statistical models (GARCH, ReturnDist,
+/// OU). All quantities are derived online from the ensemble distribution.
 #[derive(Debug, Clone)]
 pub struct AssetDistribution {
     pub asset: String,
@@ -50,10 +53,6 @@ pub struct AssetDistribution {
     /// One-way transaction cost estimate in basis points (spread + impact proxy).
     /// Set from the live order book each tick; used in both objective and TC budget.
     pub estimated_tc_bps: f64,
-    /// 95th-percentile CVaR (absolute value) from the fitted return distribution.
-    pub cvar_95: f64,
-    /// 99th-percentile CVaR (absolute value) from the fitted return distribution.
-    pub cvar_99: f64,
 }
 
 impl AssetDistribution {
@@ -72,9 +71,11 @@ impl AssetDistribution {
         self.ensemble.regime_description()
     }
 
-    /// Stop distance as a fraction of price: 2 × max(predictive_std, CVaR_95, 0.1%).
+    /// Stop distance as a fraction of price: 2 × max(predictive_std, 0.1%).
+    ///
+    /// Derived purely from the online ensemble; no batch CVaR model required.
     pub fn stop_distance_fraction(&self) -> f64 {
-        2.0 * self.predictive_std().max(self.cvar_95).max(0.001)
+        2.0 * self.predictive_std().max(0.001)
     }
 }
 
@@ -339,8 +340,6 @@ pub trait PortfolioOptimizer: Send + Sync {
                     current_fraction,
                     entry_price: 0.0,
                     estimated_tc_bps: constraints.transaction_cost_bps,
-                    cvar_95: 0.0,
-                    cvar_99: 0.0,
                 }
             })
             .collect();

@@ -224,7 +224,6 @@ mod tests {
             expected_value: edge,
             signal_confidence: 0.7,
             directional_edge: edge,
-            predicted_vol_4h: 0.02,
             regime_label: "trending".into(),
             ensemble_p_up: 0.6,
             ensemble_p_down: 0.2,

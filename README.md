@@ -1,8 +1,8 @@
 # quant_trader
 
-Quantitative perpetual-futures trading system for the [Hyperliquid](https://hyperliquid.xyz) DEX, implemented in Rust. The system ingests live order-book and trade data, runs a layered statistical pipeline with online Bayesian estimation, and executes size-risk-managed positions autonomously.
+Quantitative perpetual-futures trading system for the [Hyperliquid](https://hyperliquid.xyz) DEX, implemented in Rust. The system ingests live order-book and trade data, runs a fully online probabilistic pipeline, and executes size-risk-managed positions autonomously.
 
-Regime representation is continuous: the estimated probability distribution over future returns **is** the regime. There is no discrete hidden-state classifier (HMM removed).
+All estimation is online (O(1) per tick). There are no batch-fitted statistical models and no periodic retrain cycles. Regime representation is continuous: the fused probability distribution over future returns **is** the regime.
 
 ---
 
@@ -17,52 +17,27 @@ Regime representation is continuous: the estimated probability distribution over
                                │
                                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│  BATCH STATISTICAL MODELS  (fitted weekly or at startup)            │
-│                                                                     │
-│  ┌────────────────┐  ┌──────────────────┐  ┌────────────────────┐  │
-│  │  GARCH(1,1)-t  │  │  Return dist.    │  │  Cointegration     │  │
-│  │  σ²_t forecast │  │  Student-t       │  │  Engle–Granger ADF │  │
-│  │  (per asset,   │  │  Cauchy          │  │  OU spread fit     │  │
-│  │   1h returns)  │  │  Discrete hist.  │  │                    │  │
-│  │                │  │  → best AIC wins │  │                    │  │
-│  └────────────────┘  └──────────────────┘  └────────────────────┘  │
-└──────────────────────────────┬──────────────────────────────────────┘
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────────────┐
 │  ONLINE ESTIMATION  (every tick, O(1) per update)                   │
 │                                                                     │
-│  ┌───────────────────────────────┐  ┌───────────────────────────┐  │
-│  │  Dual Kalman Filter           │  │  Frequency Extractor      │  │
-│  │                               │  │  (Goertzel DFT, causal)   │  │
-│  │  Outer KF: parameter track    │  │                           │  │
-│  │    θ = [μ, κ, log σ_v]        │  │  Periods: 4,8,16,32,64 bars│  │
-│  │    random-walk model          │  │  band_powers[0..4]        │  │
-│  │                               │  │  dominant_period          │  │
-│  │  Inner KF: state track        │  │  spectral_entropy         │  │
-│  │    x = [level, velocity]      │  │  noise_trend_ratio        │  │
-│  │    discrete-time OU dynamics  │  │  dominant_phase           │  │
-│  │                               │  │                           │  │
-│  │  Joseph-form covariance update│  │  Circular buffer; no      │  │
-│  │  Finite-diff Jacobian link    │  │  look-ahead               │  │
-│  └───────────────────────────────┘  └───────────────────────────┘  │
-└──────────────────────────────┬──────────────────────────────────────┘
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  FEATURE ENGINEERING  (every 5-min bar, 27 dimensions)              │
+│  ┌───────────────────────────┐  ┌───────────────────────────────┐  │
+│  │  Dual Kalman Filter       │  │  Frequency Extractor          │  │
+│  │                           │  │  (Goertzel DFT, causal)       │  │
+│  │  Outer KF: parameter track│  │                               │  │
+│  │    θ = [μ, κ, log σ_v]    │  │  Periods: 4,8,16,32,64 bars  │  │
+│  │    random-walk model      │  │  band_powers[0..4]            │  │
+│  │                           │  │  dominant_period              │  │
+│  │  Inner KF: state track    │  │  spectral_entropy             │  │
+│  │    x = [level, velocity]  │  │  noise_trend_ratio            │  │
+│  │    discrete-time OU       │  │  dominant_phase               │  │
+│  │                           │  │                               │  │
+│  │  Joseph-form P update     │  │  Circular buffer; no          │  │
+│  │  Finite-diff Jacobian link│  │  look-ahead                   │  │
+│  └───────────────────────────┘  └───────────────────────────────┘  │
 │                                                                     │
-│  GARCH (1):     garch_vol                                           │
-│  Kalman (3):    kalman_level · kalman_velocity · kalman_level_dev   │
-│  Microstructure (7):                                                │
-│    spread_bps · depth_ofi · depth_ratio · price_impact             │
-│    micro_price_dev · trade_imbalance · hawkes_cross_ratio           │
-│  Funding (4):   funding_z · funding_momentum · vol_ratio · premium  │
-│  Cross-asset (4): beta_to_btc · idiosyncratic_ret · ou_z · corr    │
-│  Frequency (9): band_powers[0..4] · dominant_period                 │
-│                 spectral_entropy · noise_trend_ratio · phase        │
-│                                                                     │
-│  → 27-dimensional FeatureRow per asset per bar                      │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │  Bivariate Hawkes Process  (order-book dynamics)              │  │
+│  │  Buy/sell MLE · cross-excitation ratio α_bs/α_bb             │  │
+│  └───────────────────────────────────────────────────────────────┘  │
 └──────────────────────────────┬──────────────────────────────────────┘
                                │
                                ▼
@@ -94,7 +69,6 @@ Regime representation is continuous: the estimated probability distribution over
 │    current_fraction: f64            ← signed position / NAV        │
 │    entry_price: f64                 ← Kalman level                 │
 │    estimated_tc_bps: f64            ← spread + impact proxy        │
-│    cvar_95, cvar_99: f64            ← from fitted ReturnDist       │
 │  }                                                                  │
 │  Built per-asset per-tick; the joint optimizer's sole input type.   │
 └──────────────────────────────┬──────────────────────────────────────┘
@@ -120,7 +94,7 @@ Regime representation is continuous: the estimated probability distribution over
 │     → uniform scale-down if either is exceeded                      │
 │                                                                     │
 │  4. Leg construction:                                               │
-│     entry/stop/TP from AssetDistribution; stop = 2×max(σ, CVaR_95) │
+│     stop distance = 2 × predictive_std (online estimate)           │
 │                                                                     │
 │  → ComboOrder { legs: Vec<OrderLeg>, total_elg, total_tc_bps,      │
 │                 gross_exposure_fraction, net_exposure_fraction }    │
@@ -139,7 +113,7 @@ Regime representation is continuous: the estimated probability distribution over
 │    4. Cross-asset correlation ≤ max_correlation (data-driven)       │
 │    5. Risk-reward ratio ≥ min_rr                                    │
 │    6. Open positions ≤ max_positions                                │
-│    7. Stop distance ≥ |CVaR₉₉| (tail-adequacy gate)               │
+│    7. Signal confidence ≥ min_signal_confidence                     │
 │                                                                     │
 │  Kill switches (priority order):                                    │
 │    P1 CloseAll    — drawdown > hard_drawdown OR leverage > hard_lev │
@@ -185,7 +159,7 @@ Regime representation is continuous: the estimated probability distribution over
 
 ```
 src/
-├── main.rs                   — async main; bootstrap → live loop → weekly retrain
+├── main.rs                   — async main; bootstrap → live loop
 ├── assets.rs                 — Asset universe and metadata
 ├── config.rs                 — Config from environment variables
 ├── error.rs                  — TradingError enum
@@ -198,20 +172,12 @@ src/
 │   ├── mod.rs                — StateEstimator / ParameterEstimator traits; Observation, StatePosterior
 │   └── dual_kalman.rs        — DualKalmanFilter: joint online state + parameter estimation
 │
-├── stats/
-│   ├── distribution.rs       — StudentT · CauchyDist · DiscreteDist · ReturnDist (AIC selection)
-│   ├── garch.rs              — GARCH(1,1)-t: MLE via projected gradient descent
-│   └── cointegration.rs      — Engle–Granger test · OuProcess fitting · z-score
-│
 ├── orderbook/
 │   ├── features.rs           — OrderBookFeatures: spread, OFI, depth ratio, impact, micro-price
 │   └── hawkes.rs             — Bivariate Hawkes process: buy/sell MLE, cross-excitation ratio
 │
 ├── features/
-│   ├── kalman.rs             — 2D Kalman filter: state [level, velocity]
-│   ├── funding.rs            — FundingFeatures: z-score, momentum, carry, premium, vol_ratio
-│   ├── frequency.rs          — FrequencyExtractor (Goertzel DFT); FrequencyFeatures (9 dims)
-│   └── assembler.rs          — FeatureRow (27 dims) · FeatureStore · assemble_row()
+│   └── frequency.rs          — FrequencyExtractor (Goertzel DFT); FrequencyFeatures (9 dims)
 │
 ├── ensemble/
 │   ├── mod.rs                — ProbabilisticSignal trait; SignalOutput; EnsembleDistribution
@@ -219,10 +185,10 @@ src/
 │
 ├── optimizer/
 │   ├── mod.rs                — AssetDistribution; ComboConfig; ComboOrder; OrderLeg; PortfolioOptimizer trait
-│   └── kelly.rs              — KellyOptimizer: joint combo + DP extension
+│   └── kelly.rs              — KellyOptimizer: joint combo + subset selection
 │
 ├── signals/
-│   └── generator.rs          — generate_combo() → ComboOrder (primary); generate_signals() (backtest compat)
+│   └── generator.rs          — generate_combo() → ComboOrder
 │
 ├── risk/
 │   ├── manager.rs            — RiskManager (7 pre-trade checks) · PortfolioState · Position
@@ -235,42 +201,6 @@ src/
 └── backtest/
     └── mod.rs                — BacktestEngine (walk-forward) · BacktestResult · FoldResult
 ```
-
----
-
-## Feature vector (27 dimensions)
-
-| # | Field | Source |
-|---|-------|--------|
-| 1 | `garch_vol` | GARCH(1,1)-t one-step σ forecast |
-| 2 | `kalman_level` | DualKF posterior state[0] (level) |
-| 3 | `kalman_velocity` | DualKF posterior state[1] (velocity) |
-| 4 | `kalman_level_dev` | (price − level) / level |
-| 5 | `spread_bps` | Best bid/ask spread in basis points |
-| 6 | `depth_ofi` | Order-flow imbalance (depth-weighted) |
-| 7 | `depth_ratio` | Bid depth / (bid + ask depth) |
-| 8 | `price_impact` | Market-impact cost at 1% ADV |
-| 9 | `micro_price_dev` | (micro_price − mid) / mid |
-| 10 | `trade_imbalance` | Buy volume / total volume (rolling 2h) |
-| 11 | `hawkes_cross_ratio` | α_bs / α_bb: buy→sell cross-excitation |
-| 12 | `funding_z` | Z-score of funding rate vs 30-sample history |
-| 13 | `funding_momentum` | Trend of recent funding samples |
-| 14 | `vol_ratio` | Realised vol (1h) / realised vol (1d) |
-| 15 | `premium_pct` | (mark − oracle) / oracle |
-| 16 | `beta_to_btc` | Rolling 60-bar beta vs BTC |
-| 17 | `idiosyncratic_ret` | ret − β × btc_ret |
-| 18 | `ou_z_score` | OU spread z-score (cointegration pair) |
-| 19 | `corr_to_btc` | Rolling 60-bar Pearson correlation vs BTC |
-| 20 | `band_powers[0]` | Goertzel power at 4-bar period |
-| 21 | `band_powers[1]` | Goertzel power at 8-bar period |
-| 22 | `band_powers[2]` | Goertzel power at 16-bar period |
-| 23 | `band_powers[3]` | Goertzel power at 32-bar period |
-| 24 | `band_powers[4]` | Goertzel power at 64-bar period |
-| 25 | `dominant_period` | Period with highest normalised power |
-| 26 | `spectral_entropy` | Shannon entropy of power spectrum (0=trend, 1=noise) |
-| 27 | `noise_trend_ratio` | High-freq power / total power |
-
-Frequency features (20–27) require `freq_window_bars` bars of warm-up. Until then, `freq_features` is `None` and the 9 slots are zeroed.
 
 ---
 
@@ -288,7 +218,7 @@ Parameters are clamped each tick: μ∈[−0.01, 0.01], κ∈[0.001, 0.98], log 
 
 ## Bayesian Ensemble Fusion
 
-`BayesianFusion` combines up to N `ProbabilisticSignal` sources:
+`BayesianFusion` combines three `ProbabilisticSignal` sources — DualKF, FrequencyExtractor, Hawkes:
 
 1. Each source emits `log_evidence = log p(z_t | model)` per tick.
 2. An EMA of log-evidence is maintained per source: `ema ← decay·ema + (1−decay)·le`.
@@ -308,8 +238,8 @@ Three built-in adapters convert module outputs into `SignalOutput`:
 `AssetDistribution` is the boundary type between estimation and optimization. After each tick, the main loop builds one per asset:
 
 ```
-DualKF posterior → entry_price, cvar from ReturnDist
-BayesianFusion   → ensemble: EnsembleDistribution
+DualKF posterior  → entry_price, predictive_std (via BayesianFusion)
+BayesianFusion    → ensemble: EnsembleDistribution
 order book spread → estimated_tc_bps
 portfolio state   → current_fraction (signed)
 ```
@@ -321,11 +251,11 @@ portfolio state   → current_fraction (signed)
 | 1 — Per-asset sizing | f*_i = kelly_fraction × μ_i/(σ_i²+μ_i²), TC-adjusted per asset |
 | 2 — Subset selection | Maximise Σ(ELG_i − Δf_i·tc_i) subject to cardinality and TC budget |
 | 3 — Exposure scaling | Uniform scale-down if gross or net exposure exceeds portfolio limits |
-| 4 — Leg construction | Entry, stop (2×max(σ,CVaR₉₅)), take-profit (regime-dependent R:R) |
+| 4 — Leg construction | Entry, stop (2 × predictive_std), take-profit (regime-dependent R:R) |
 
 **Subset selection** uses exhaustive C(n,k) enumeration when n_candidates ≤ 10 (at most C(10,3)=120 evaluations; global optimum guaranteed) and falls back to greedy ranking for larger sets.
 
-**TC budget constraint**: Σ_i [|f_i_new − f_i_prev| × estimated_tc_bps_i] ≤ MAX_COMBO_TC_BPS ensures the total round-trip cost of the combo stays within the configured budget. Assets are excluded (worst ELG/TC ratio first) until the budget is met.
+**TC budget constraint**: Σ_i [|f_i_new − f_i_prev| × estimated_tc_bps_i] ≤ MAX_COMBO_TC_BPS ensures the total round-trip cost of the combo stays within the configured budget.
 
 ---
 
@@ -366,20 +296,6 @@ If `CloseAll` is triggered, all open positions are liquidated via IOC market ord
 
 ---
 
-## Return distribution fitting
-
-Three candidate models are fitted per asset and ranked by AIC:
-
-| Distribution | Params | Fitting | VaR / CVaR |
-|---|---|---|---|
-| **Student-t** | μ, σ, ν | EM-MLE (digamma Newton) | Exact quantile + closed-form ES |
-| **Cauchy** | x₀, γ | IRLS (location) + Newton (scale) | Exact quantile; bounded CVaR |
-| **Discrete** | k bins | Scott's-rule histogram + Laplace smoothing | Piecewise-linear CDF |
-
-The winning model is stored in `dist_models` and used for CVaR-aware sizing and the stop-adequacy check (stop distance ≥ |CVaR₉₉|).
-
----
-
 ## Configuration
 
 All parameters are read from environment variables (`.env` supported via `dotenvy`):
@@ -416,17 +332,6 @@ All parameters are read from environment variables (`.env` supported via `dotenv
 
 ---
 
-## Retraining schedule
-
-- **Startup**: full retrain before the first tick.
-- **Weekly**: every 2016 ticks (≈7 days at 5-min bars), triggered automatically in the main loop.
-
-Each retrain fits: GARCH(1,1)-t · return distributions (AIC selection) · Engle–Granger cointegration · OU spread processes.
-
-Online estimators (`DualKalmanFilter`, `FrequencyExtractor`, `BayesianFusion`) update every tick and do not require a retrain cycle.
-
----
-
 ## Dependencies
 
 | Crate | Purpose |
@@ -434,7 +339,7 @@ Online estimators (`DualKalmanFilter`, `FrequencyExtractor`, `BayesianFusion`) u
 | `hypersdk` | Hyperliquid REST + WebSocket client |
 | `tokio` | Async runtime |
 | `nalgebra` | Matrix algebra (Dual Kalman filter) |
-| `statrs` | `ln_gamma` for Student-t / GARCH likelihood |
+| `statrs` | Statistical distributions |
 | `parking_lot` | Low-latency `RwLock` for shared state |
 | `serde` / `serde_json` | Signal serialisation |
 | `uuid` | Unique signal IDs |

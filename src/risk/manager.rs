@@ -12,7 +12,6 @@ use rust_decimal::prelude::ToPrimitive;
 use crate::{
     error::TradingError,
     signals::generator::{Direction, TradeSignal},
-    stats::distribution::ReturnDist,
 };
 
 use super::limits::RiskLimits;
@@ -147,13 +146,11 @@ impl<'a> RiskManager<'a> {
 
     /// Validate a signal before execution.
     ///
-    /// `dist`: fitted return distribution for tail-risk check (optional).
     /// `corr_matrix`: rolling correlation data for pair-concentration check.
     pub fn check_signal(
         &self,
         signal: &TradeSignal,
         portfolio: &PortfolioState,
-        dist: Option<&ReturnDist>,
         corr_matrix: Option<&HashMap<String, f64>>,
     ) -> Result<(), TradingError> {
         // 1. Portfolio drawdown limit.
@@ -235,22 +232,6 @@ impl<'a> RiskManager<'a> {
                     signal.signal_confidence, self.limits.min_signal_confidence
                 ),
             });
-        }
-
-        // 8. Tail-adequacy: stop distance must cover 99% CVaR.
-        if let Some(dist) = dist {
-            let cvar_99 = dist.cvar(0.99).abs();
-            let stop_dist = signal.stop_distance_pct();
-            if cvar_99 > 0.0 && stop_dist < cvar_99 {
-                return Err(TradingError::RiskCheckFailed {
-                    reason: format!(
-                        "Stop distance {:.2}% < 99% CVaR {:.2}% ({} dist)",
-                        stop_dist * 100.0,
-                        cvar_99 * 100.0,
-                        dist.name(),
-                    ),
-                });
-            }
         }
 
         Ok(())

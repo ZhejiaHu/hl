@@ -545,8 +545,6 @@ mod tests {
             current_fraction: 0.0,
             entry_price: 100.0,
             estimated_tc_bps: tc_bps,
-            cvar_95: sigma * 0.5,
-            cvar_99: sigma * 1.0,
         }
     }
 

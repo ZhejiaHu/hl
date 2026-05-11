@@ -1,32 +1,21 @@
 //! Signal generation: converts the joint portfolio optimization result into
 //! structured trade signals ready for risk checking and execution.
 //!
-//! ## Primary path (live trading)
-//! `generate_combo` takes a slice of per-asset `AssetDistribution`s (built by
-//! the main loop after estimation) and calls the `KellyOptimizer` to produce
-//! one `ComboOrder` — a jointly optimized set of legs such as
-//! "long 0.20 BTC + short 0.15 ETH".
+//! ## Pipeline
+//! `generate_combo` takes a slice of per-asset `AssetDistribution`s built by
+//! the main loop (DualKF → FrequencyExtractor → Hawkes → BayesianFusion) and
+//! calls `KellyOptimizer::optimize_combo` to produce one `ComboOrder`.
 //!
-//! ## Backtest / compat path
-//! `generate_signals` produces per-asset `TradeSignal`s from the older
-//! `HashMap<String, EnsembleDistribution>` interface. Used by tests and legacy
-//! single-asset simulation code.
-
-use std::collections::HashMap;
-
-use uuid::Uuid;
+//! There are no batch-fitted statistical models in this path. All inputs are
+//! derived online from the three probabilistic signal sources.
 
 use crate::{
-    assets::Asset,
     config::Config,
-    ensemble::EnsembleDistribution,
-    features::assembler::FeatureRow,
     optimizer::{
         AssetDistribution, ComboConfig, ComboOrder, PortfolioConstraints,
-        PortfolioOptimizer, TradeDecision, kelly::KellyOptimizer,
+        PortfolioOptimizer, kelly::KellyOptimizer,
     },
     risk::manager::PortfolioState,
-    stats::distribution::ReturnDist,
 };
 
 // ── Direction ────────────────────────────────────────────────────────────────
@@ -53,11 +42,11 @@ impl std::fmt::Display for Direction {
     }
 }
 
-// ── TradeSignal (backtest / single-asset compat) ──────────────────────────────
+// ── TradeSignal ───────────────────────────────────────────────────────────────
 
-/// A fully specified single-asset trade signal ready for risk checking and
-/// execution. Produced by `generate_signals` (backtest path) or by converting
-/// an `OrderLeg` via `leg_to_signal` in the main loop.
+/// A fully specified single-asset trade signal used by `RiskManager` and
+/// `Executor`. Produced by converting an `OrderLeg` via `leg_to_signal` in
+/// the main loop.
 #[derive(Debug, Clone)]
 pub struct TradeSignal {
     pub signal_id: String,
@@ -73,7 +62,6 @@ pub struct TradeSignal {
     pub expected_value: f64,
     pub signal_confidence: f64,
     pub directional_edge: f64,
-    pub predicted_vol_4h: f64,
     pub regime_label: String,
     pub ensemble_p_up: f64,
     pub ensemble_p_down: f64,
@@ -113,19 +101,18 @@ impl TradeSignal {
             "ensemble_p_up": self.ensemble_p_up,
             "ensemble_p_down": self.ensemble_p_down,
             "ensemble_confidence": self.ensemble_confidence,
-            "predicted_vol_4h": self.predicted_vol_4h,
         })
     }
 }
 
-// ── Primary path: joint combo generation ─────────────────────────────────────
+// ── Combo generation ──────────────────────────────────────────────────────────
 
 /// Generate a joint combo order from per-asset distribution estimates.
 ///
-/// This is the primary entry point for the live trading system. Each
-/// `AssetDistribution` contains the fused ensemble, entry price, and transaction
-/// cost estimate, so the optimizer can make fully-informed joint decisions
-/// (e.g. "long BTC + short ETH") rather than sizing each asset independently.
+/// All inputs are online estimates — no batch-fitted models needed:
+/// - `ensemble` from `BayesianFusion` over DualKF + FrequencyExtractor + Hawkes
+/// - `entry_price` from the DualKF posterior level
+/// - `estimated_tc_bps` from the live order book spread
 pub fn generate_combo(
     asset_dists: &[AssetDistribution],
     portfolio: &PortfolioState,
@@ -138,112 +125,4 @@ pub fn generate_combo(
     );
     let combo_config = ComboConfig::from_config(config);
     KellyOptimizer::new().optimize_combo(asset_dists, portfolio, &constraints, &combo_config)
-}
-
-// ── Backtest / compat path ────────────────────────────────────────────────────
-
-/// Generate per-asset trade signals from ensemble distributions.
-///
-/// Retained for the backtest engine and any single-asset code paths.
-/// Live trading code should use `generate_combo` instead.
-pub fn generate_signals(
-    assets: &[Asset],
-    distributions: &HashMap<String, EnsembleDistribution>,
-    feature_rows: &HashMap<String, FeatureRow>,
-    portfolio: &PortfolioState,
-    config: &Config,
-    dist_models: &HashMap<String, ReturnDist>,
-) -> Vec<TradeSignal> {
-    let now_ms = timestamp_ms();
-    let constraints = PortfolioConstraints::from_risk_config(
-        config.max_portfolio_leverage,
-        config.max_single_asset_weight,
-        config.kelly_fraction,
-    );
-
-    let optimizer = KellyOptimizer::new();
-    let decisions: Vec<TradeDecision> = optimizer.optimize(distributions, portfolio, &constraints);
-
-    let mut signals: Vec<TradeSignal> = Vec::new();
-
-    for decision in &decisions {
-        let asset = match assets.iter().find(|a| a.symbol == decision.asset) {
-            Some(a) => a,
-            None => continue,
-        };
-        let dist = match distributions.get(&decision.asset) {
-            Some(d) => d,
-            None => continue,
-        };
-        let row = match feature_rows.get(&decision.asset) {
-            Some(r) => r,
-            None => continue,
-        };
-
-        let entry = row.kalman_level;
-        if entry <= 0.0 { continue; }
-
-        let cvar_95 = dist_models
-            .get(&decision.asset)
-            .map(|d| d.cvar(0.95).abs())
-            .unwrap_or(0.0);
-        let predicted_vol = dist.predictive_std.max(cvar_95).max(0.001);
-        let atr_stop = 2.0 * predicted_vol * entry;
-        let min_rr = regime_min_rr(dist);
-
-        let (stop_loss, take_profit) = match decision.direction {
-            Direction::Long => (entry - atr_stop, entry + atr_stop * min_rr),
-            Direction::Short => (entry + atr_stop, entry - atr_stop * min_rr),
-        };
-        if stop_loss <= 0.0 || take_profit <= 0.0 { continue; }
-
-        let ev = dist.directional_edge().abs() * dist.confidence;
-
-        signals.push(TradeSignal {
-            signal_id: Uuid::new_v4().to_string(),
-            generated_at_ms: now_ms,
-            asset: asset.symbol.clone(),
-            asset_index: asset.index,
-            direction: decision.direction,
-            entry_price: entry,
-            stop_loss,
-            take_profit,
-            leverage: decision.leverage,
-            position_size_usd: decision.position_size_usd,
-            expected_value: ev,
-            signal_confidence: decision.confidence,
-            directional_edge: dist.directional_edge(),
-            predicted_vol_4h: predicted_vol,
-            regime_label: decision.regime_label.clone(),
-            ensemble_p_up: dist.p_up,
-            ensemble_p_down: dist.p_down,
-            ensemble_confidence: dist.confidence,
-        });
-    }
-
-    signals.sort_by(|a, b| b.expected_value.partial_cmp(&a.expected_value).unwrap());
-    let mut seen = std::collections::HashSet::new();
-    signals
-        .into_iter()
-        .filter(|s| seen.insert(s.asset.clone()))
-        .take(3)
-        .collect()
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-fn regime_min_rr(dist: &EnsembleDistribution) -> f64 {
-    match dist.regime_description() {
-        "high_vol" => 3.0,
-        "trending" => 2.0,
-        "consolidating" => 1.5,
-        _ => 2.0,
-    }
-}
-
-fn timestamp_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
